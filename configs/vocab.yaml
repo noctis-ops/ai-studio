@@ -1,0 +1,30 @@
+moods:
+  - adventurous
+  - tense
+  - melancholic
+  - hopeful
+  - awe
+  - humorous
+  - somber
+  - determined
+
+shot_types:
+  - establishing_wide
+  - medium_shot
+  - close_up
+  - over_the_shoulder
+  - tracking_shot
+  - extreme_close_up
+  - aerial
+
+camera_moves:
+  - static
+  - pan_left
+  - pan_right
+  - tilt_up
+  - tilt_down
+  - dolly_in
+  - dolly_out
+  - orbit
+
+intensity: [1, 2, 3, 4, 5]
