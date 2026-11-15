@@ -1,21 +1,27 @@
+# Phase 2 preflight (2026-11-09): LLM entries verified against official sources —
+#   Anthropic pricing: https://platform.claude.com/docs/en/models/overview (Sonnet 4.5: 200K ctx,
+#     64K max output, $3/$15 per MTok; Claude 3.7 Sonnet is no longer listed and must not be used)
+#   OpenAI pricing: https://platform.openai.com/docs/pricing (gpt-4o-mini: 128K ctx,
+#     16,384 max output, $0.15 input / $0.60 output, $0.075 cached input, per MTok)
+# TTS/image/video entries remain intentionally unverified; draft/final stay blocked until they are.
 registry_version: 1
 models:
   llm.creative:                       # direction, shot planning, bible updates
     provider: anthropic
     capability: llm
-    model_id: "claude-3-5-sonnet-latest"      # UNVERIFIED alias, confirm before Phase 2
-    pricing: {unit: per_1m_tokens, in_usd: 0.0, out_usd: 0.0}
-    pricing_verified_on: null
+    model_id: "claude-sonnet-4-5-20250929"    # dated snapshot; alias "claude-sonnet-4-5" also valid
+    pricing: {unit: per_1m_tokens, in_usd: 3.0, out_usd: 15.0}
+    pricing_verified_on: "2026-11-09"
     commercial_use_verified: true
-    needs_confirmation: true
+    needs_confirmation: false
   llm.light:                          # tashkeel, metadata, safety filtering
     provider: openai
     capability: llm
-    model_id: "gpt-4o-mini"
-    pricing: {unit: per_1m_tokens, in_usd: 0.0, out_usd: 0.0}
-    pricing_verified_on: null
+    model_id: "gpt-4o-mini"                     # alias serves the current snapshot; alt: gpt-4o-mini-2024-07-18
+    pricing: {unit: per_1m_tokens, in_usd: 0.15, out_usd: 0.6}
+    pricing_verified_on: "2026-11-09"
     commercial_use_verified: true
-    needs_confirmation: true
+    needs_confirmation: false
   tts.main:
     provider: elevenlabs
     capability: tts
@@ -23,7 +29,7 @@ models:
     pricing: {unit: per_1k_chars, usd: 0.0}
     pricing_verified_on: null
     commercial_use_verified: true
-    commercial_use_note: "Operator attestation: ElevenLabs Creator plan, commercial license, no attribution. Re-verify."
+    commercial_use_note: "Operator confirmed 2026-11-09: ElevenLabs Creator Plan, commercial license included, no attribution required."
     needs_confirmation: true
   image.keyframe:
     provider: fal
