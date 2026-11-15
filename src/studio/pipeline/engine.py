@@ -61,6 +61,7 @@ class Engine:
         gates: GateService | None = None,
         gateway: ProviderGateway | None = None,
         worker_id: str = "worker",
+        llm_subset_only: bool = False,
     ) -> None:
         self.db = db
         self.repos = repos
@@ -71,6 +72,9 @@ class Engine:
         self.gates = gates or GateService(db, repos, clock, dag, self.ids)
         self._gateway = gateway
         self.worker_id = worker_id
+        # Text-pipeline (S1-S4) runs resolve only the LLM roles: the media
+        # registry entries are placeholders until Phase 4.
+        self.llm_subset_only = llm_subset_only
 
     # ==================================================================
     # context / gateway
@@ -99,7 +103,10 @@ class Engine:
         from studio.pipeline.context import RunContext
 
         settings = self.config.settings
-        resolved = self.config.registry.resolve_profile(run.profile)
+        if self.llm_subset_only:
+            resolved = self.config.registry.resolve_llm_subset(run.profile)
+        else:
+            resolved = self.config.registry.resolve_profile(run.profile)
         languages = resolve_languages(settings)
         aspects = list(settings.aspects)
         return RunContext(

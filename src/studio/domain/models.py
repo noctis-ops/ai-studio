@@ -53,6 +53,8 @@ class DeliverableRow(_Row):
     language: str
     channel_id: str
     created_at: str
+    metadata_json: str | None = None
+    safety_status: str = "pending"
 
 
 class ShotRow(_Row):

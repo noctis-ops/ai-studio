@@ -3,6 +3,7 @@ a FakeClock, deterministic IDs, and a gateway wired to the mock providers."""
 
 from __future__ import annotations
 
+import os
 import random
 import shutil
 from pathlib import Path
@@ -12,6 +13,12 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIGS_SRC = REPO_ROOT / "configs"
+
+# T-LIVE-01: the live smoke test is opt-in; when STUDIO_LIVE_LLM != '1' it is
+# not collected at all (not merely skipped) — it must never run in CI.
+collect_ignore = []
+if os.environ.get("STUDIO_LIVE_LLM") != "1":
+    collect_ignore.append("test_live_smoke.py")
 
 FAKE_SECRET = "falkey-0123456789abcdef0123456789abcdef"
 

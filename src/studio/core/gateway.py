@@ -585,6 +585,7 @@ class ProviderGateway:
                     "schema_name": req.schema_name,
                     "max_tokens": req.max_tokens,
                     "temperature": req.temperature,
+                    "expect_json": req.expect_json,
                 },
                 [],
                 req.prompt_version_sha,
