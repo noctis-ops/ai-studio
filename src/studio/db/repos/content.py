@@ -21,6 +21,7 @@ from .base import SqliteRepo, row_to_dict
 
 class ContentRepo(Protocol):
     def create_series(self, *, name: str, slug: str) -> SeriesRow: ...
+    def get_series(self, series_id: str) -> SeriesRow | None: ...
 
     def create_character(
         self, *, series_id: str, role: str, name: str, voices_json: str
@@ -49,6 +50,13 @@ class ContentRepo(Protocol):
     ) -> DeliverableRow: ...
 
     def list_deliverables(self, episode_id: str) -> list[DeliverableRow]: ...
+    def set_deliverable_metadata(
+        self,
+        *,
+        deliverable_id: str,
+        metadata_json: str,
+        safety_status: str,
+    ) -> None: ...
 
     def get_deliverable(self, deliverable_id: str) -> DeliverableRow | None: ...
 
@@ -92,6 +100,14 @@ class ContentRepo(Protocol):
 
 class SqliteContentRepo(SqliteRepo):
     # ---- series / characters -----------------------------------------------
+
+    def get_series(self, series_id: str) -> SeriesRow | None:
+        row = (
+            self.db.connect()
+            .execute("SELECT * FROM series WHERE id = ?", (series_id,))
+            .fetchone()
+        )
+        return SeriesRow.model_validate(row_to_dict(row)) if row else None
 
     def create_series(self, *, name: str, slug: str) -> SeriesRow:
         now = self._now()
@@ -242,6 +258,30 @@ class SqliteContentRepo(SqliteRepo):
             .fetchall()
         )
         return [DeliverableRow.model_validate(row_to_dict(r)) for r in rows]
+
+    def set_deliverable_metadata(
+        self,
+        *,
+        deliverable_id: str,
+        metadata_json: str,
+        safety_status: str,
+    ) -> None:
+        import json as _json
+
+        from studio.domain.errors import StudioError
+
+        if safety_status not in ("pending", "clear", "flagged"):
+            raise StudioError(f"safety_status must be pending|clear|flagged, got {safety_status!r}")
+        try:
+            _json.loads(metadata_json)
+        except _json.JSONDecodeError as exc:
+            raise StudioError(f"metadata_json is not valid JSON: {exc}") from exc
+        result = self.db.connect().execute(
+            "UPDATE deliverables SET metadata_json = ?, safety_status = ? WHERE id = ?",
+            (metadata_json, safety_status, deliverable_id),
+        )
+        if result.rowcount != 1:
+            raise StudioError(f"deliverable not found: {deliverable_id}")
 
     def get_deliverable(self, deliverable_id: str) -> DeliverableRow | None:
         row = (

@@ -49,6 +49,7 @@ class LLMRequest(BaseModel):
     max_tokens: int = 1024
     temperature: float = 0.0
     prompt_version_sha: str | None = None
+    expect_json: bool = False
 
 
 class LLMResult(BaseModel):
@@ -56,6 +57,7 @@ class LLMResult(BaseModel):
     parsed_json: Any | None = None
     tokens_in: int = 0
     tokens_out: int = 0
+    raw_ref: str | None = None
 
 
 class TTSRequest(BaseModel):

@@ -87,6 +87,12 @@ class RetentionSettings(_Strict):
     keep_narration_audio_days: int = Field(default=30, ge=0)
 
 
+class TextPipelineSettings(_Strict):
+    context_token_budget: int = Field(default=6000, ge=500, le=100000)
+    tashkeel_retry: int = Field(default=1, ge=0, le=2)
+    s4_after_g1: bool = True
+
+
 def _dedupe(values: list[str], *, what: str) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
@@ -110,6 +116,7 @@ class Settings(_Strict):
     pricing: PricingSettings = PricingSettings()
     mock: MockSettings = MockSettings()
     retention: RetentionSettings = RetentionSettings()
+    text_pipeline: TextPipelineSettings = TextPipelineSettings()
 
     @field_validator("languages", mode="before")
     @classmethod

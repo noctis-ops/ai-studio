@@ -11,6 +11,7 @@ Key guarantees (enforced here, relied on everywhere else):
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -204,9 +205,53 @@ class ModelRegistry:
         if role_map is None:
             known = ", ".join(sorted(self._data.profiles))
             raise RegistryError(f"{self.source}: unknown profile {name!r} (known: {known})")
+        model_keys, entries = self._resolve_roles(name, role_map, role_map.keys())
+        return ResolvedProfile(
+            name=name,
+            registry_version=self._data.registry_version,
+            model_keys=model_keys,
+            entries=entries,
+        )
+
+    def resolve_llm_subset(self, name: str) -> ResolvedProfile:
+        """Resolve only the LLM roles (llm_creative, llm_light) of a profile.
+
+        Phase 2 runs the LLM-only subset (S1-S4) until TTS/image/video are
+        verified in the registry (Phase 4), so the media roles — still
+        placeholders by design — are excluded from resolution here. The full
+        `resolve_profile` is unchanged: T-CFG-04 keeps refusing draft/final
+        end-to-end until every role passes.
+
+        Placeholder and zero-price guards still apply to the LLM entries for
+        draft/final; sandbox is allowed to resolve simulated/free models.
+        """
+        role_map = self._data.profiles.get(name)
+        if role_map is None:
+            known = ", ".join(sorted(self._data.profiles))
+            raise RegistryError(f"{self.source}: unknown profile {name!r} (known: {known})")
+        llm_roles = [role for role in ("llm_creative", "llm_light") if role in role_map]
+        if not llm_roles:
+            raise RegistryError(
+                f"{self.source}: profiles.{name}: no LLM roles (llm_creative/llm_light) defined"
+            )
+        model_keys, entries = self._resolve_roles(name, role_map, llm_roles)
+        return ResolvedProfile(
+            name=name,
+            registry_version=self._data.registry_version,
+            model_keys=model_keys,
+            entries=entries,
+        )
+
+    def _resolve_roles(
+        self,
+        name: str,
+        role_map: dict[str, str],
+        roles: Iterable[str],
+    ) -> tuple[dict[str, str], dict[str, ModelEntry]]:
         model_keys: dict[str, str] = {}
         entries: dict[str, ModelEntry] = {}
-        for role, key in role_map.items():
+        for role in roles:
+            key = role_map[role]
             entry = self._data.models.get(key)
             if entry is None:
                 raise RegistryError(f"{self.source}: profiles.{name}.{role}: missing model {key!r}")
@@ -236,12 +281,7 @@ class ModelRegistry:
                         f"({_zero_price_problem(entry)}); refusing to resolve profile {name!r}. "
                         f"Enter real prices or set pricing_acknowledged_free: true"
                     )
-        return ResolvedProfile(
-            name=name,
-            registry_version=self._data.registry_version,
-            model_keys=model_keys,
-            entries=entries,
-        )
+        return model_keys, entries
 
     # ---- snapshot / export guard ----------------------------------------------
 

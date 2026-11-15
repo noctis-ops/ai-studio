@@ -19,3 +19,4 @@ pricing: {llm_tokens_per_char_worst_case: 0.5}   # conservative for Arabic when 
 mock: {tts_chars_per_second: 15, video_width_16x9: 480, video_height_16x9: 270, fps: 24,
        poll_ticks: 2}
 retention: {keep_raw_clips_days: 30, keep_narration_audio_days: 30}
+text_pipeline: {context_token_budget: 6000, tashkeel_retry: 1, s4_after_g1: true}
