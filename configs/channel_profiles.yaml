@@ -1,0 +1,5 @@
+channels:
+  yt_ar_wide:     {language: ar, aspect: "16:9", platform: youtube}
+  yt_en_wide:     {language: en, aspect: "16:9", platform: youtube}
+  short_ar_tall:  {language: ar, aspect: "9:16", platform: shorts_tiktok}
+  short_en_tall:  {language: en, aspect: "9:16", platform: shorts_tiktok}

@@ -1,0 +1,21 @@
+paths: {home: "${STUDIO_HOME}", db: data/studio.db, cas: data/cas, exports: data/exports, projects: data/projects}
+
+# ---- Language / aspect switches (CRITICAL) ----
+# Defaults for new episodes; can be overridden per episode. Stages must iterate these, never hardcode.
+languages: ["ar"]            # allowed values: ar, en. Launch config is Arabic-only.
+aspects: ["9:16"]            # allowed values: 9:16, 16:9. First benchmark is a single-aspect Short.
+default_profile: draft       # sandbox | draft | final
+
+worker: {max_concurrency: 1, per_provider_concurrency: 1, heartbeat_s: 20, stale_after_s: 120,
+         idle_poll_s: 0.5, job_retry_backoff_s: 30}
+retry: {transient_max: 5, backoff_base_s: 2, backoff_cap_s: 60}
+gates: {allow_auto_approve_in: [sandbox, draft]}
+budgets:
+  default_episode_cap_usd: 10.0      # benchmark Short cap
+  monthly_cap_usd: 150.0
+  global_cap_usd: null
+  warn_pct: 80
+pricing: {llm_tokens_per_char_worst_case: 0.5}   # conservative for Arabic when estimating input tokens
+mock: {tts_chars_per_second: 15, video_width_16x9: 480, video_height_16x9: 270, fps: 24,
+       poll_ticks: 2}
+retention: {keep_raw_clips_days: 30, keep_narration_audio_days: 30}
