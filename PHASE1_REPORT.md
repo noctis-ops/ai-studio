@@ -1,6 +1,6 @@
 # Phase 1 Report — Foundation Layer ("AI Content Studio")
 
-Date: 2026-11-09 · Branch: `arena/143b1398-ai-studio` · Base: `b9e6410` (main) · Status: local commit, not pushed
+Date: 2026-11-09 · Branch: `arena/143b1398-ai-studio` · Base: `b9e6410` (main) · Status: pushed to GitHub (`c15cbb1`)
 
 Environment used to verify: Linux sandbox, Python 3.11.2, ffmpeg on PATH
 (static build via the `imageio-ffmpeg` PyPI wheel) plus a throwaway `ffprobe` shim
