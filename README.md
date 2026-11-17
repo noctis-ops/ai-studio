@@ -1,10 +1,11 @@
-# AI Studio — Phase 1 (Foundation)
+# AI Studio — Phase 3 (Voice and Audio)
 
 A local, single-operator pipeline that will orchestrate paid generative-AI APIs to
-produce cinematic animated videos. **Phase 1 ships the safety infrastructure only:
-no real provider is ever called by this codebase today.** The demo pipeline runs
-entirely on mock providers, and it is what the test suite and the demo commands
-below exercise.
+produce cinematic animated videos. **Phase 3 ships the voice and audio engine:
+a real ElevenLabs TTS adapter (offline tests run on mocks), a local,
+deterministic audio pipeline (library scan, seeded selection, 24 fps timeline,
+ducking, mastering, persisted QC), and the S5a/S5/S6/S7/S7b stages.** The demo
+pipeline runs on mock providers, and that is what the test suite exercises.
 
 Priorities, in order:
 
@@ -26,8 +27,13 @@ src/studio/
   db/               SQLite connection (WAL, FK on, busy_timeout=5000), migrations, repos
   demo/             Demo seed + demo stages (LLM → TTS → keyframes → clips → finalize)
   domain/           Money (integer micro-USD), enums, errors, refs (SubjectRef lineage)
-  pipeline/         DAG, engine (invalidation/gates/budget halt), worker, recovery
-  providers/        Base provider contracts + mocks (LLM, TTS, image, video)
+  pipeline/         DAG, engine (invalidation/gates/budget halt), worker, recovery,
+                    stages_audio (S5a preflight, S5 TTS, S6 timing, S7 plan, S7b mix)
+  audio/            Audio engine: analysis, library, timeline, conform, stem, selector,
+                    envelope, ducking, mixer, mastering (stdlib + ffmpeg only)
+  qc/               Persisted audio QC (qc_results)
+  providers/        Base provider contracts + mocks (LLM, TTS, image, video),
+                    providers/tts/elevenlabs.py (raw httpx, injectable transport)
 tests/              §I test suite (offline, mock providers, FakeClock)
 configs/            Defaults you are expected to edit for real budgets/providers
 ```
@@ -137,9 +143,93 @@ mypy
 ```
 
 Coverage gate: **≥ 90% line coverage** on `studio.core`, `studio.db`,
-`studio.pipeline` (currently 93% total; CI enforces `--cov-fail-under=90`).
+`studio.pipeline`, `studio.audio` and `studio.providers.tts` (currently 92.97%
+total; CI enforces `--cov-fail-under=90` and runs `pytest -m "not slow"`).
 
-## How it works (30-second tour)
+## Audio engine
+
+Phase 3 adds a fully local, deterministic audio path alongside the pre-existing
+pipeline stages. Everything under `src/studio/audio/` is language-agnostic
+(Arabic normalization happens in `language/arabic.py` before anything reaches the
+engine), all audio math is in integer samples at `audio.sample_rate` (48 kHz;
+`render.fps` must divide it exactly or the config fails to load), and every
+persisted output goes through the CAS with `-bitexact`.
+
+### Library format
+
+```
+library/{music,sfx,ambience}/<track>.{wav,mp3,flac,ogg}
+library/{music,sfx,ambience}/index.yaml
+```
+
+Each `index.yaml` has a per-directory `defaults:` block plus a `tracks:` list.
+Per track: `file`, `title`, `moods` (music; controlled vocab from `vocab.yaml`)
+or `tags` (sfx/ambience), `intensity` 1–5 (music), `bpm`, `loopable`, `license`,
+`license_url`, `attribution_required`, `attribution_text`, `source`.
+
+```bash
+studio library scan     # probes loudness (ebur128) + duration, registers sha256
+studio library list     # --kind music|sfx|ambience, --inactive for skipped tracks
+studio library check    # coverage grid per mood x intensity
+```
+
+Only **active** tracks are selected: a track needs a license, valid tags, a
+readable file and a duration > 0, otherwise it is stored inactive with
+`scan_error` set. A renamed file updates its row (keyed by sha256); a deleted
+file flips `active=0` but is never removed (`audio_cues` reference it).
+
+### S5/S6: voices, narration, timing
+
+- `studio voice set <character_slug> --series <slug> --language <code>
+  --voice-id <id> [--stability ...] [--speed ...] [--mix-gain-db ...]
+  [--attest-commercial]` — `--attest-commercial` is required before `final`
+  runs will pass S5a preflight. `studio voice list`.
+- `studio tts audition --voice-id <id> [--model-keys tts.main,...]
+  --lines-file <utf-8 file> [--no-diacritics-variant] [--cap-usd 0.50]`
+  renders (model × line × diacritics) variants through the gateway into
+  `data/previews/audition/<ts>/` with a `README.txt` of per-file cost. Prints
+  the worst-case total first and requires `--yes` to proceed. This is the
+  A/B knob for Arabic tashkeel on/off (`tts.keep_diacritics` in
+  `configs/settings.yaml`).
+- Narration overflow is **never** fixed by editing your text automatically.
+  S6 fails closed with a per-shot overflow report; fix the line yourself:
+
+```bash
+studio narration show <episode_id>              # lines + status
+studio narration edit <line_id> --file edit.txt # UTF-8; writes text_final,
+                                                # audits post_gate_edit w/ hashes
+studio resume <run_id>                          # re-voices only that line
+```
+
+- `studio audio calibrate [--episode <id>]` prints measured words/second per
+  language and a suggested `timing.words_per_second`; it never writes config.
+
+### Ducking, mixing, mastering
+
+- Music/ambience/SFX selection is deterministic (no RNG: per-episode hash
+  tie-break) and identical across the languages of an episode.
+- The narration stem is assembled with stdlib `wave` (sample-exact); the mix
+  is one ffmpeg filtergraph written to a file (`-/filter_complex` on
+  ffmpeg ≥ 7.0, `-filter_complex_script` otherwise).
+- Ducking: `envelope` (default, piecewise-linear gain curve on the music bus;
+  ambience gets `ambience_fraction × depth_db`) or `sidechain`
+  (`sidechaincompress` keyed by the narration stem). Both meet the same QC.
+- Mastering: two-pass `loudnorm` to −14 LUFS / −1.5 dBTP, then re-conformed to
+  exact length, verified by `ebur128` + `astats` (else `MasteringError`).
+- `studio audio preview <deliverable_id> [--stem master|narration]` copies the
+  result to `data/previews/`; `studio audio qc <deliverable_id>` re-prints the
+  persisted `qc_results` rows (duck depth, speech-to-music ratio, loudness,
+  true peak, plan coverage, license completeness, per-line narration RMS).
+
+### What is *not* verified live
+
+The ElevenLabs adapter is built to the documented endpoint shape but has never
+been run against the live API from this repo. Model IDs and per-1k-char
+pricing in `configs/model_registry.yaml` are placeholders marked unverified;
+see `PHASE3_REPORT.md` ("Known limitations"). Set `ELEVENLABS_API_KEY` to
+exercise `studio tts audition` / `T-EL-06` for real.
+
+
 
 - **Jobs & CAS.** Every stage run is enqueued as a job with a `dedupe_key`
   (`run:stage:subject`). Identical inputs (same model, prompt, seed, refs, nonce)
@@ -175,13 +265,20 @@ Coverage gate: **≥ 90% line coverage** on `studio.core`, `studio.db`,
 
 ## CI
 
-GitHub Actions (`.github/workflows/ci.yml`) runs ruff, mypy, and the test suite
-with the 90% coverage gate on **Ubuntu and Windows**, Python 3.11 and 3.12.
-`ffmpeg` is installed on the runners (or via choco on Windows); ffmpeg-marked
-tests auto-skip if it is unavailable.
+GitHub Actions (`.github/workflows/ci.yml`) runs ruff, mypy, an ffmpeg
+capability check (`scripts/check_ffmpeg.py`: ffmpeg ≥ 5.0 and the full filter
+list incl. `loudnorm ebur128 astats sidechaincompress`), and the test suite
+with the 90% coverage gate on **Ubuntu and Windows**, Python 3.11 and 3.12,
+via `pytest -m "not slow"`. ffmpeg comes from
+`FedericoCarboni/setup-ffmpeg` (pinned) on both OSes; ffmpeg-marked tests
+auto-skip if the binaries are unavailable.
 
 ## License / status
 
-Phase 1 foundation. No real provider calls are implemented; the registry ships
-placeholders. See `PHASE1_REPORT.md` for test results, coverage, deviations,
-decisions and known limitations.
+Phase 3 complete on this branch: text pipeline (Phase 2) + ElevenLabs TTS
+adapter + local audio engine (S5a–S7b). The demo path still runs on mock
+providers; real-provider calls are opt-in via environment flags. ElevenLabs
+model IDs and pricing are placeholders marked unverified. See
+`PHASE3_REPORT.md` for test results, coverage, deviations, decisions and
+known limitations (and `PHASE1_REPORT.md`, `PHASE2_REPORT.md` for earlier
+phases).

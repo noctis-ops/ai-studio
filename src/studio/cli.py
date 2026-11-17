@@ -18,6 +18,7 @@ from rich.console import Console
 from rich.table import Table
 
 from studio.config.loader import AppConfig, load_all
+from studio.core.budget import LedgerService
 from studio.core.clock import SystemClock, format_ts
 from studio.core.ids import UlidIds
 from studio.db import build_repos, migrate
@@ -47,8 +48,14 @@ app.add_typer(gates_app, name="gates")
 app.add_typer(budget_app, name="budget")
 voice_app = typer.Typer(help="Character voices (TTS).")
 narration_app = typer.Typer(help="Narration lines (post-Gate-1 edits).")
+library_app = typer.Typer(help="Audio library scan/list/check.")
+tts_app = typer.Typer(help="TTS utilities (audition).")
+audio_app = typer.Typer(help="Audio outputs: preview, QC report, calibrate.")
 app.add_typer(voice_app, name="voice")
 app.add_typer(narration_app, name="narration")
+app.add_typer(library_app, name="library")
+app.add_typer(tts_app, name="tts")
+app.add_typer(audio_app, name="audio")
 
 console = Console()
 err_console = Console(stderr=True)
@@ -101,6 +108,183 @@ def init() -> None:
     console.print(f"initialized {home}")
     console.print(f"migrations applied: {applied or 'already up to date'}")
 
+def _tts_registry_rows() -> list[tuple[str, str, str]]:
+    """Phase 3 rows: every non-simulated TTS entry must be placeholder-free;
+    an unverified price warns (the operator must confirm before `final`)."""
+    home = _home()
+    try:
+        config = load_all(home)
+    except StudioError as exc:
+        return [("studio config", "FAIL", f"load_all({home}): {exc}"[:200])]
+    rows: list[tuple[str, str, str]] = []
+    for key, entry in sorted(config.registry.models.items()):
+        if entry.capability != "tts" or entry.simulated:
+            continue
+        fails: list[str] = []
+        warns: list[str] = []
+        if entry.placeholder:
+            fails.append("placeholder model_id (confirm the ElevenLabs model first)")
+        if entry.needs_confirmation:
+            warns.append("needs_confirmation is true")
+        if entry.pricing_verified_on is None:
+            warns.append(
+                "price never verified (set pricing_verified_on after checking your dashboard)"
+            )
+        if fails:
+            rows.append((f"TTS registry {key}", "FAIL", "; ".join(fails + warns)))
+        elif warns:
+            rows.append((f"TTS registry {key}", "WARN", "; ".join(warns)))
+        else:
+            rows.append(
+                (
+                    f"TTS registry {key}",
+                    "PASS",
+                    f"verified {entry.pricing_verified_on}; "
+                    f"commercial_use_verified={entry.commercial_use_verified}",
+                )
+            )
+    if not rows:
+        rows.append(
+            ("TTS registry", "WARN", "no non-simulated TTS entries (sandbox only?)")
+        )
+    return rows
+
+
+def _phase3_doctor_rows() -> list[tuple[str, str, str]]:
+    """Phase 3 checks: ffmpeg filtergraph option, fps, sample rate, audio
+    library, TTS registry, voice attestations, ELEVENLABS_API_KEY, diacritics."""
+    import json as _json
+
+    rows: list[tuple[str, str, str]] = []
+    home = _home()
+    try:
+        config = load_all(home)
+    except StudioError as exc:
+        return [("studio config", "FAIL", f"load_all({home}): {exc}"[:200])]
+    settings = config.settings
+
+    # ffmpeg filtergraph file option (informational)
+    try:
+        from studio.video.ffmpeg import ffmpeg_version
+
+        ff_version = asyncio.run(asyncio.wait_for(ffmpeg_version(), timeout=30.0))
+        via = ("-/filter_complex (ffmpeg >= 7)" if ff_version >= (7, 0, 0)
+                else "-filter_complex_script (ffmpeg < 7)")
+        rows.append(("ffmpeg filtergraph file option", "PASS", via))
+    except Exception as exc:
+        rows.append(("ffmpeg filtergraph file option", "WARN", str(exc)[:160]))
+
+    # sample rate divisible by fps
+    fps = settings.render.fps
+    sample_rate = settings.audio.sample_rate
+    if sample_rate % fps == 0:
+        rows.append(
+            (f"sample rate % fps ({sample_rate} % {fps})", "PASS",
+             f"{sample_rate // fps} samples/frame")
+        )
+    else:
+        rows.append((
+            f"sample rate % fps ({sample_rate} % {fps})",
+            "FAIL",
+            f"{sample_rate} must be divisible by render.fps={fps}",
+        ))
+
+    # ELEVENLABS_API_KEY presence (never the value itself)
+    if os.environ.get("ELEVENLABS_API_KEY"):
+        rows.append(("ELEVENLABS_API_KEY", "PASS", "set (value hidden)"))
+    else:
+        rows.append((
+            "ELEVENLABS_API_KEY",
+            "WARN",
+            "not set — required for real TTS calls (sandbox/mock does not need it)",
+        ))
+
+    # tts.keep_diacritics (informational)
+    keep = settings.tts.keep_diacritics
+    rows.append((
+        "tts.keep_diacritics",
+        "PASS",
+        ("sends diacritized text as-is (higher char cost, better Arabic tashkeel)"
+         if keep else
+         "strips diacritics before sending (A/B knob; changes TTS cache keys)"),
+    ))
+
+    # audio library status
+    try:
+        db = Database(Path(settings.paths.db))
+        migrate(db)
+        clock = SystemClock()
+        repos = build_repos(db, clock, UlidIds())
+        library = repos.audio.list_library(include_inactive=True)
+        if not library:
+            rows.append(("audio library", "WARN", "empty — run `studio library scan`"))
+        else:
+            active = [r for r in library if r.active]
+            per_kind: dict[str, int] = {}
+            for row in active:
+                per_kind[row.kind] = per_kind.get(row.kind, 0) + 1
+            counts = ", ".join(f"{kind}={n}" for kind, n in sorted(per_kind.items()))
+            rows.append((
+                "audio library",
+                "PASS",
+                f"active: {counts}; inactive: {len(library) - len(active)}",
+            ))
+            cells: set[tuple[str, int]] = set()
+            for row in active:
+                if row.kind != "music" or row.intensity is None:
+                    continue
+                try:
+                    tags = _json.loads(row.moods_json)
+                except _json.JSONDecodeError:
+                    tags = []
+                for tag in tags:
+                    cells.add((str(tag), int(row.intensity)))
+            empty = [f"{mood}@{i}" for mood in config.vocab.moods
+                    for i in range(1, 6) if (mood, i) not in cells]
+            if empty:
+                rows.append((
+                    "library mood x intensity",
+                    "WARN",
+                    f"{len(empty)} empty cells (e.g. {', '.join(empty[:5])}) — selection falls "
+                    f"back to neighbors",
+                ))
+            else:
+                rows.append(
+                    ("library mood x intensity", "PASS",
+                     f"all {len(config.vocab.moods)} x 5 cells covered")
+                )
+
+        # voices without attestation (any series in this home)
+        voice_rows = db.connect().execute(
+            "SELECT settings_json FROM character_voices"
+        ).fetchall()
+        unattested = 0
+        for voice in voice_rows:
+            try:
+                from studio.audio.voice import parse_voice_settings
+
+                parsed = parse_voice_settings(str(voice["settings_json"]))
+                attested = parsed.license_attested_at
+            except Exception:
+                attested = None
+            if not attested:
+                unattested += 1
+        if not voice_rows:
+            rows.append(("voice attestations", "PASS", "no voices configured in this home"))
+        elif unattested:
+            rows.append((
+                "voice attestations",
+                "FAIL",
+                f"{unattested}/{len(voice_rows)} voices lack license_attested_at "
+                f"(re-run `studio voice set ... --attest-commercial` before final)",
+            ))
+        else:
+            rows.append(("voice attestations", "PASS", f"{len(voice_rows)} voices attested"))
+    except Exception as exc:
+        rows.append(("audio library / voices", "FAIL", str(exc)[:200]))
+
+    rows.extend(_tts_registry_rows())
+    return rows
 
 def _llm_registry_rows() -> list[tuple[str, str, str]]:
     """Phase 2 rows: both LLM entries must be verified (dates shown)."""
@@ -264,6 +448,10 @@ def doctor(
         )
     except Exception as exc:
         checks.append(("ffmpeg capability check", "FAIL", str(exc)[:200]))
+
+    # Phase 3: ffmpeg filtergraph option, fps, library, TTS registry, voices,
+    # ELEVENLABS_API_KEY, tts.keep_diacritics.
+    checks.extend(_phase3_doctor_rows())
 
     # Phase 2: both LLM registry entries must be verified (dates shown).
     checks.extend(_llm_registry_rows())
@@ -1018,6 +1206,500 @@ def _dag_for_pending(repos: StudioRepos, run_id: str | None) -> Dag:
 
         return Dag(text_specs())
     return Dag(_demo_specs_light())
+
+
+
+# ======================================================================
+# library — audio library scan / list / check (Phase 3, §H13)
+# ======================================================================
+
+
+@library_app.command("scan")
+def library_scan() -> None:
+    """Reconcile <library_root> with the audio_library table (idempotent)."""
+    from studio.audio.library import resolve_library_root, scan_library
+
+    config, db, clock, _ids, repos = _connect()
+    del clock
+    migrate(db)
+    root = resolve_library_root(config.settings)
+    if not root.is_dir():
+        console.print(
+            f"[yellow]library root {root} does not exist — nothing scanned "
+            f"(set audio.library_root in settings.yaml, or run "
+            f"`studio run --demo` to seed fixtures)[/yellow]"
+        )
+        return
+    report = _run_async(
+        scan_library(
+            library_root=root,
+            repos=repos.audio,
+            vocab=config.vocab,
+            scan_extensions=tuple(config.settings.audio.scan_extensions),
+        )
+    )
+    active = repos.audio.list_library(include_inactive=False)
+    inactive = [r for r in repos.audio.list_library(include_inactive=True) if not r.active]
+    console.print(f"library scan: {root}")
+    console.print(f"  scanned (active-eligible files): {report.scanned}")
+    console.print(f"  activated this run: {report.activated}")
+    console.print(f"  updated this run: {report.updated}")
+    console.print(f"  active tracks: {len(active)}")
+    console.print(f"  inactive tracks: {len(inactive)}")
+    if report.missing_on_disk:
+        console.print("  missing on disk (kept, marked inactive):")
+        for rel in report.missing_on_disk:
+            console.print(f"    - {rel}")
+    if report.invalid:
+        console.print("  invalid (registered inactive with scan_error):")
+        for rel, err in report.invalid:
+            console.print(f"    - {rel}: {err}")
+    if not report.ok:
+        console.print("[yellow]library scan completed with problems (see above)[/yellow]")
+
+
+@library_app.command("list")
+def library_list(
+    kind: str | None = typer.Option(None, "--kind", help="music | sfx | ambience"),
+    inactive: bool = typer.Option(False, "--inactive", help="Include inactive tracks."),
+) -> None:
+    """List audio library entries (active only by default)."""
+    if kind is not None and kind not in ("music", "sfx", "ambience"):
+        _fail(f"unknown --kind {kind!r} (expected music|sfx|ambience)")
+    config, db, clock, _ids, repos = _connect()
+    del config, db, clock
+    rows = repos.audio.list_library(kind=kind, include_inactive=inactive)
+    if not rows:
+        console.print("no library entries (run `studio library scan` first)")
+        return
+    table = Table(title=f"audio library{' — all' if inactive else ''}")
+    for column in ("kind", "title", "tags", "intensity", "dur", "lufs", "license", "state"):
+        table.add_column(column)
+    for row in rows:
+        try:
+            tags = ",".join(json.loads(row.moods_json))
+        except json.JSONDecodeError:
+            tags = "INVALID"
+        lufs = f"{row.loudness_lufs:+.1f}" if row.loudness_lufs is not None else "-"
+        state = "active" if row.active else f"inactive ({row.scan_error or 'unknown'})"
+        table.add_row(
+            row.kind,
+            row.title,
+            tags,
+            str(row.intensity) if row.intensity is not None else "-",
+            f"{row.duration_ms / 1000:.1f}s",
+            lufs,
+            row.license or "-",
+            state,
+        )
+    console.print(table)
+
+
+@library_app.command("check")
+def library_check() -> None:
+    """Print mood x intensity coverage for ACTIVE tracks; warn on empty cells."""
+    config, db, clock, _ids, repos = _connect()
+    del db, clock
+    music = repos.audio.list_library(kind="music", include_inactive=False)
+    tag_of: dict[str, set[str]] = {}
+    cells: dict[tuple[str, int], int] = {}
+    empty_cells: list[str] = []
+    for row in music:
+        try:
+            tags = json.loads(row.moods_json)
+        except json.JSONDecodeError:
+            tags = []
+        if row.intensity is None:
+            continue
+        for tag in tags:
+            tag_of.setdefault(tag, set()).add(str(row.intensity))
+            cells[(tag, int(row.intensity))] = cells.get((tag, int(row.intensity)), 0) + 1
+    table = Table(title="music coverage (active tracks): cells = track count")
+    table.add_column("mood")
+    for intensity in range(1, 6):
+        table.add_column(str(intensity))
+    for mood in config.vocab.moods:
+        row_cells: list[str] = []
+        for intensity in range(1, 6):
+            count = cells.get((mood, intensity), 0)
+            if count == 0:
+                row_cells.append("[yellow]·[/yellow]")
+                empty_cells.append(f"{mood} @ intensity {intensity}")
+            else:
+                row_cells.append(str(count))
+        table.add_row(mood, *row_cells)
+    console.print(table)
+
+    for kind, tags in (("ambience", config.vocab.ambience_tags), ("sfx", config.vocab.sfx_tags)):
+        rows = repos.audio.list_library(kind=kind, include_inactive=False)
+        counts = {tag: 0 for tag in tags}
+        for row in rows:
+            try:
+                row_tags = json.loads(row.moods_json)
+            except json.JSONDecodeError:
+                row_tags = []
+            for tag in row_tags:
+                if tag in counts:
+                    counts[tag] += 1
+        counts_text = ", ".join(f"{tag}={n}" for tag, n in sorted(counts.items()))
+        console.print(f"{kind} tags: {counts_text}")
+        uncovered = [tag for tag, n in counts.items() if n == 0]
+        if uncovered:
+            missing_text = ", ".join(sorted(uncovered))
+            console.print(f"[yellow]{kind}: no active track for: {missing_text}[/yellow]")
+
+    if empty_cells:
+        console.print(
+            f"[yellow]warning: {len(empty_cells)} empty mood x intensity cells "
+            f"(scoring may fall back to neighbors or loop)[/yellow]"
+        )
+
+
+# ======================================================================
+# tts — ElevenLabs audition (Phase 3, §H2)
+# ======================================================================
+
+
+@tts_app.command("audition")
+def tts_audition(
+    voice_id: str = typer.Option(..., "--voice-id", help="Provider voice id."),
+    model_keys: str = typer.Option(
+        "tts.main",
+        "--model-keys",
+        help="Comma-separated registry keys (audition candidates).",
+    ),
+    lines_file: str = typer.Option(..., "--lines-file", help="UTF-8 file with one line per call."),
+    language: str = typer.Option(Language.AR.value, "--language", help="ar | en"),
+    no_diacritics_variant: bool = typer.Option(
+        False, "--no-diacritics-variant", help="Only the diacritized text, no stripped variant."
+    ),
+    cap_usd: float = typer.Option(
+        0.50, "--cap-usd", min=0.0, help="Hard cap on total audition spend (worst case)."
+    ),
+    yes: bool = typer.Option(False, "--yes", help="Proceed (required to spend)."),
+) -> None:
+    """Render (model x line x diacritics-variant) through the Gateway.
+
+    episode_id is NULL on purpose: month/global budgets apply. The worst-case
+    total must fit under --cap-usd before ANY call is made; a running-total
+    guard re-checks before every subsequent call. Deterministic nonces make
+    re-running the same audition free (cache hits).
+    """
+    import hashlib
+    import shutil
+    from datetime import UTC, datetime
+
+    from studio.core.gateway import CallContext, ProviderGateway
+    from studio.core.pricing import estimate_cost_musd
+    from studio.domain.money import usd_to_musd
+    from studio.language.tashkeel import normalize_nfc, strip_tashkeel
+    from studio.providers.base import TTSRequest
+
+    config, db, clock, ids, repos = _connect()
+    del repos
+    migrate(db)
+    try:
+        language_enum = Language(language.strip())
+    except ValueError:
+        _fail(f"unknown language {language!r} (allowed: ar, en)")
+
+    lines_path = Path(lines_file)
+    if not lines_path.is_file():
+        _fail(f"lines file not found: {lines_path}")
+    try:
+        raw = lines_path.read_bytes()
+        text_file = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        _fail(f"{lines_file} is not UTF-8 (save it as UTF-8; Windows consoles mangle Arabic argv)")
+    lines = [line.strip() for line in text_file.splitlines() if line.strip()]
+    if not lines:
+        _fail(f"{lines_file} contains no non-empty lines")
+
+    keys = [key.strip() for key in model_keys.split(",") if key.strip()]
+    if not keys:
+        _fail("--model-keys must name at least one registry key")
+    entries: list[tuple[str, Any]] = []
+    for key in keys:
+        entry = config.registry.models.get(key)
+        if entry is None:
+            _fail(f"unknown model_key {key!r} in model_registry.yaml")
+        if entry.capability != "tts":
+            _fail(f"{key!r} has capability {entry.capability!r}, expected tts")
+        entries.append((key, entry))
+
+    keep_diacritics = bool(config.settings.tts.keep_diacritics)
+
+    def variants(text: str) -> list[tuple[str, str]]:
+        out = [("diacritics", text)] if keep_diacritics else [("plain", text)]
+        if not no_diacritics_variant:
+            plain = strip_tashkeel(normalize_nfc(text))
+            if plain != out[0][1]:
+                out.append(("plain", plain))
+        return out
+
+    plan: list[tuple[str, Any, str, str, str]] = []  # key, entry, text, variant, filename_slug
+    for index, line in enumerate(lines, start=1):
+        for key, entry in entries:
+            for variant, variant_text in variants(line):
+                slug = key.replace(".", "-")
+                plan.append((key, entry, variant_text, variant, f"{index:03d}_{slug}_{variant}"))
+
+    cap_musd = usd_to_musd(str(cap_usd))
+    estimates = []
+    for _key, entry, variant_text, _variant, _slug in plan:
+        req = TTSRequest(text=variant_text, voice_id=voice_id, language=language_enum)
+        estimates.append(estimate_cost_musd(entry, req))
+    worst_case_total = sum(estimates)
+    console.print(
+        f"audition plan: {len(lines)} lines x {len(entries)} models "
+        f"x up to 2 variants = {len(plan)} files"
+    )
+    console.print(f"worst-case cost: ${musd_to_usd(worst_case_total):.4f} (cap ${cap_usd:.4f})")
+    if worst_case_total > cap_musd:
+        _fail(
+            f"worst-case audition cost exceeds --cap-usd "
+            f"({musd_to_usd(worst_case_total):.4f} > {cap_usd:.4f}); "
+            f"raise the cap or use fewer lines/models"
+        )
+    if not yes:
+        _fail("aborted (nothing spent) — re-run with --yes to proceed")
+
+    from studio.core.cas import ContentStore
+
+    cas = ContentStore(Path(config.settings.paths.cas), db, clock)
+    gateway = ProviderGateway(
+        db=db,
+        settings=config.settings,
+        registry=config.registry,
+        cas=cas,
+        ledger=_ledger_for(db, config, clock, ids),
+        clock=clock,
+        ids=ids,
+        poll_interval_s=0.05,
+        max_polls=1000,
+    )
+
+    outdir = (
+        Path(config.settings.paths.home)
+        / "data"
+        / "previews"
+        / "audition"
+        / datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    )
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    report_lines = [
+        "tts audition report",
+        f"voice_id: {voice_id}",
+        f"models: {', '.join(keys)}",
+        f"cap_usd: {cap_usd}",
+        "",
+    ]
+    total_spent = 0
+    failures: list[str] = []
+    for (key, _entry, variant_text, variant, slug), est in zip(plan, estimates, strict=True):
+        if total_spent + est > cap_musd:
+            failures.append(f"{slug}: skipped — running total would exceed the cap")
+            continue
+        nonce_material = f"{key}|{voice_id}|{variant}|{variant_text}".encode()
+        nonce = hashlib.sha256(nonce_material).hexdigest()[:16]
+        req = TTSRequest(text=variant_text, voice_id=voice_id, language=language_enum)
+        ctx = CallContext(
+            episode_id=None, stage_run_id=None, nonce=nonce, purpose="tts_audition"
+        )
+        try:
+            result = _run_async(gateway.tts(key, req, ctx))
+        except Exception as exc:
+            failures.append(f"{slug}: {type(exc).__name__}: {exc}")
+            continue
+        ref = result.assets[0]
+        source = cas.resolve(ref.sha256)
+        target = outdir / f"{slug}{source.suffix or '.mp3'}"
+        shutil.copy2(source, target)
+        total_spent += int(result.cost_musd)
+        report_lines.append(
+            f"{target.name}\tmodel={key}\tvariant={variant}\tchars={len(variant_text)}\t"
+            f"cost_usd={musd_to_usd(int(result.cost_musd)):.4f}"
+        )
+        console.print(f"  {target.name}  ${musd_to_usd(int(result.cost_musd)):.4f}")
+
+    report_lines.append("")
+    report_lines.append(f"total_spent_usd: {musd_to_usd(total_spent):.4f}")
+    if failures:
+        report_lines.append("failures:")
+        report_lines.extend(f"  - {failure}" for failure in failures)
+    (outdir / "README.txt").write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+    console.print(f"audition written to {outdir}")
+    console.print(f"total spent: ${musd_to_usd(total_spent):.4f}")
+    if failures:
+        console.print(f"[yellow]{len(failures)} call(s) failed/skipped (see README.txt)[/yellow]")
+
+
+def _ledger_for(
+    db: Database, config: AppConfig, clock: SystemClock, ids: UlidIds
+) -> LedgerService:
+    return LedgerService(db, clock, config.settings, ids)
+
+
+# ======================================================================
+# audio — preview / QC report / calibrate (Phase 3, §H13)
+# ======================================================================
+
+
+@audio_app.command("preview")
+def audio_preview(
+    deliverable_id: str = typer.Argument(..., help="Deliverable id."),
+    stem: str = typer.Option("master", "--stem", help="master | narration"),
+) -> None:
+    """Copy the deliverable's audio into data/previews/ with a readable name."""
+    import re
+    import shutil
+
+    from studio.core.cas import ContentStore
+
+    if stem not in ("master", "narration"):
+        _fail(f"unknown --stem {stem!r} (expected master|narration)")
+    config, db, clock, _ids, repos = _connect()
+    migrate(db)
+    masters = repos.audio.list_masters(deliverable_id=deliverable_id)
+    ready = [row for row in masters if row.status == "ready"]
+    if not ready:
+        _fail(f"no ready audio master for deliverable {deliverable_id} (run the pipeline first)")
+    row = sorted(ready, key=lambda r: r.created_at)[-1]
+    sha = row.master_sha256 if stem == "master" else row.narration_stem_sha256
+    if not sha:
+        _fail("the ready master has no narration stem recorded")
+    cas = ContentStore(Path(config.settings.paths.cas), db, clock)
+    source = cas.resolve(sha)
+
+    deliverable = repos.content.get_deliverable(deliverable_id)
+    language = deliverable.language if deliverable else "und"
+    slug = "deliverable"
+    if deliverable is not None:
+        track = repos.content.get_track(deliverable.track_id)
+        episode = repos.content.get_episode(track.episode_id) if track else None
+        if episode is not None:
+            slug = re.sub(r"[^a-z0-9]+", "-", episode.title.lower()).strip("-")[:40] or slug
+    target_dir = Path(config.settings.paths.home) / "data" / "previews"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"{slug}-{language}-{stem}-{row.input_hash[:8]}{source.suffix}"
+    shutil.copy2(source, target)
+    console.print(f"preview written to {target} ({target.stat().st_size} bytes)")
+
+
+@audio_app.command("qc")
+def audio_qc(
+    deliverable_id: str = typer.Argument(..., help="Deliverable id."),
+) -> None:
+    """Print the QC results persisted for the latest ready master.
+
+    Note: the music pre/post-duck stems are mix-time work files, so duck
+    depth cannot be re-measured without a re-render. This prints exactly the
+    QC captured when the master was produced.
+    """
+    _config, db, clock, _ids, repos = _connect()
+    del _config, clock, _ids
+    migrate(db)
+    masters = repos.audio.list_masters(deliverable_id=deliverable_id)
+    ready = [row for row in masters if row.status == "ready"]
+    if not ready:
+        _fail(f"no ready audio master for deliverable {deliverable_id}")
+    row = sorted(ready, key=lambda r: r.created_at)[-1]
+    console.print(
+        f"master: deliverable={deliverable_id} total_samples={row.total_samples} "
+        f"loudness_i={row.loudness_i} true_peak={row.true_peak} lra={row.lra} "
+        f"duck_depth_db={row.duck_depth_db}"
+    )
+    try:
+        stats = json.loads(row.stats_json or "{}")
+    except json.JSONDecodeError:
+        stats = {}
+    qc = stats.get("qc") or []
+    if not qc:
+        console.print("[yellow]no persisted QC detail on this master row[/yellow]")
+        return
+    table = Table(title="audio QC (persisted at mix time)")
+    for column in ("check", "status", "detail"):
+        table.add_column(column)
+    for result in qc:
+        status = str(result.get("status", "?"))
+        style = {"pass": "green", "warn": "yellow", "fail": "red"}.get(status, "white")
+        table.add_row(
+            str(result.get("name", "?")),
+            f"[{style}]{status}[/{style}]",
+            json.dumps(result.get("detail", {}), ensure_ascii=False, sort_keys=True),
+        )
+    console.print(table)
+
+
+@audio_app.command("calibrate")
+def audio_calibrate(
+    episode: str | None = typer.Option(None, "--episode", help="Episode id (default: all)."),
+) -> None:
+    """Print measured words/second per language and a suggested setting.
+
+    Reads narration_lines with voiced audio_duration_ms and word counts.
+    Prints only — the config file is never modified.
+    """
+    from studio.domain.enums import Language as _Language
+    from studio.language import count_words
+
+    _config, db, clock, _ids, repos = _connect()
+    del _config, clock, _ids, repos
+    migrate(db)
+    if episode is not None:
+        row = db.connect().execute(
+            "SELECT id FROM episodes WHERE id = ?", (episode,)
+        ).fetchone()
+        if row is None:
+            _fail(f"episode not found: {episode}")
+    rows = db.connect().execute(
+        """
+        SELECT d.language AS language,
+               COALESCE(n.text_final, n.text) AS text,
+               n.duration_ms AS duration_ms
+        FROM narration_lines n
+        JOIN deliverables d ON d.id = n.deliverable_id
+        JOIN tracks t ON t.id = d.track_id
+        JOIN episodes e ON e.id = t.episode_id
+        WHERE (? IS NULL OR e.id = ?)
+          AND n.duration_ms IS NOT NULL AND n.duration_ms > 0
+        """,
+        (episode, episode),
+    ).fetchall()
+    if not rows:
+        _fail("no voiced lines found (run the pipeline first)")
+    totals: dict[str, list[float]] = {}
+    for row in rows:
+        lang = str(row["language"])
+        try:
+            language_enum = _Language(lang)
+        except ValueError:
+            continue
+        words = count_words(language_enum, str(row["text"]))
+        seconds = float(row["duration_ms"]) / 1000.0
+        entry = totals.setdefault(lang, [0.0, 0.0, 0.0])
+        entry[0] += words
+        entry[1] += seconds
+        entry[2] += 1
+    table = Table(title="measured speech rate (voiced lines)")
+    for column in ("language", "lines", "words", "seconds", "words/second"):
+        table.add_column(column)
+    suggested: dict[str, float] = {}
+    for lang, (total_words, total_seconds, line_count) in sorted(totals.items()):
+        wps = total_words / total_seconds if total_seconds else 0.0
+        suggested[lang] = round(wps, 2)
+        table.add_row(
+            lang, str(int(line_count)), str(int(total_words)),
+            f"{total_seconds:.1f}", f"{wps:.2f}",
+        )
+    console.print(table)
+    console.print(
+        "suggested timing.words_per_second (paste into settings.yaml):"
+    )
+    suggested_text = ", ".join(f"{k}: {v}" for k, v in sorted(suggested.items()))
+    console.print(f"  words_per_second: {{{suggested_text}}}")
+    console.print("(calibrate never writes config)")
 
 
 def main() -> None:  # pragma: no cover

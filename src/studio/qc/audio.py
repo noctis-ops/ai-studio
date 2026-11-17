@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import math
+from array import array
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -77,14 +78,16 @@ class AudioQcInputs:
     no_mood_match_warn: bool = False
 
 
-async def _decode(path: str, timeout_s: float = 300.0) -> list[int]:
+async def _decode(path: str, timeout_s: float = 300.0) -> array[int]:
+    """Decode to a stdlib ``array('h')`` of s16 samples (memory-lean for
+    full-length masters; a Python int list would cost ~36 bytes/sample)."""
     hint = Path(str(path)).suffix.lower().lstrip(".")
     args = ["-hide_banner", "-v", "error"]
     if hint in ("wav", "flac", "mp3", "ogg", "aac", "m4a"):
         args += ["-f", "wav" if hint == "wav" else hint]
     args += ["-i", str(path), "-ac", "1", "-f", "s16le", "pipe:1"]
     stdout, _ = await run_ffmpeg(args, timeout_s=timeout_s)
-    return list(s16_le_samples(stdout))
+    return s16_le_samples(stdout)
 
 
 async def run_audio_qc(inputs: AudioQcInputs, spec: QcSpec) -> list[QcCheckResult]:
@@ -92,7 +95,7 @@ async def run_audio_qc(inputs: AudioQcInputs, spec: QcSpec) -> list[QcCheckResul
     sr = inputs.sample_rate
 
     # ---- decode master once (drives length + presence + ratio)
-    master_samples: Any = None
+    master_samples: array[int] | None = None
     try:
         master_samples = await _decode(inputs.master_path)
         decode_error = None
@@ -100,7 +103,7 @@ async def run_audio_qc(inputs: AudioQcInputs, spec: QcSpec) -> list[QcCheckResul
         decode_error = str(exc)
 
     ok = decode_error is None and master_samples is not None
-    if not ok or len(master_samples) == 0:
+    if not ok or (master_samples is not None and len(master_samples) == 0):
         results.append(QcCheckResult(
             "unreadable_or_empty", "fail",
             {"error": decode_error or "zero samples decoded"},
@@ -108,6 +111,7 @@ async def run_audio_qc(inputs: AudioQcInputs, spec: QcSpec) -> list[QcCheckResul
         # everything downstream is meaningless; return early
         return results
 
+    assert master_samples is not None
     results.append(QcCheckResult(
         "unreadable_or_empty", "pass", {"samples": len(master_samples)},
     ))
@@ -178,7 +182,7 @@ async def run_audio_qc(inputs: AudioQcInputs, spec: QcSpec) -> list[QcCheckResul
     placements = [(int(s), int(length)) for s, length in inputs.placements]
     onset = sr * spec.exclude_onset_ms // 1000
 
-    stem_samples: list[int] | None = None
+    stem_samples: array[int] | None = None
     try:
         stem_samples = await _decode(inputs.narration_stem_path)
     except Exception:

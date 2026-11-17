@@ -28,7 +28,7 @@ from studio.audio.ducking import (
     speech_spans,
 )
 from studio.audio.envelope import build_gain_expr, depth_of_expression
-from studio.audio.mastering import master_two_pass  # noqa: F401  (re-exported for clarity)
+from studio.audio.mastering import master_two_pass
 from studio.audio.mixer import CueRender, DuckSpec, render_premaster
 from studio.audio.stem import build_narration_stem
 from studio.audio.timeline import LinePlacement, Timeline
@@ -933,3 +933,265 @@ async def test_t_mix_01_and_02_sandbox_master_row_flacs_and_loudness(tmp_path, m
 
     levels = await astats_levels(str(master_path))
     assert levels.get("peak_db") is not None and levels["peak_db"] <= -0.1
+
+
+# ======================================================================
+# T-ENG-12 (sandbox ar vs ar+en: TTS and mix counts double, images/videos
+# unchanged, video timelines identical)
+# ======================================================================
+
+
+def _render_sandbox(tmp_path, monkeypatch, *, languages, aspects, filename):
+    config, db, clock, ids, repos, _home = _env(
+        tmp_path, monkeypatch, filename=filename, paid=False,
+    )
+    _seeded, run_row = _seed_run(
+        config, repos, ids, languages=languages, aspects=aspects, auto_approve=True,
+    )
+    engine, _dag = _engine(db, repos, config, clock, ids)
+    worker = _worker(db, engine, repos, config, clock, ids)
+
+    import asyncio
+
+    async def _go():
+        await worker.run(until_idle=True)
+        while True:
+            pending = db.connect().execute(
+                "SELECT id FROM approval_gates WHERE status='pending' ORDER BY created_at"
+            ).fetchall()
+            if not pending:
+                break
+            for gate in pending:
+                repos.pipeline.approve_gate(gate[0], decided_by="test")
+            await worker.run(until_idle=True)
+
+    asyncio.run(_go())
+    run = repos.pipeline.get_run(run_row.id)
+    assert run is not None and run.status == "completed"
+
+    def one(capability):
+        return db.connect().execute(
+            "SELECT count(*) FROM provider_calls WHERE capability = ?", (capability,),
+        ).fetchone()[0]
+
+    masters = db.connect().execute(
+        "SELECT count(*) FROM audio_masters WHERE status = 'ready'"
+    ).fetchone()[0]
+    shots = [
+        r[0]
+        for r in db.connect().execute(
+            "SELECT shot_from || ':' || shot_to FROM scenes ORDER BY scene_no"
+        ).fetchall()
+    ]
+    lines = db.connect().execute(
+        "SELECT count(*) FROM narration_lines WHERE duration_ms IS NOT NULL"
+    ).fetchone()[0]
+    return {
+        "tts": one("tts"),
+        "image": one("image_reference_generate"),
+        "video": one("image_to_video"),
+        "llm": one("llm"),
+        "masters": masters,
+        "voiced_lines": lines,
+        "shots": shots,
+    }
+
+
+@pytest.mark.ffmpeg
+def test_t_eng_12_sandbox_ar_vs_ar_en_counts(tmp_path, monkeypatch):
+    single = _render_sandbox(
+        tmp_path, monkeypatch, languages=("ar",), aspects=("9:16",), filename="eng12a",
+    )
+    double = _render_sandbox(
+        tmp_path, monkeypatch, languages=("ar", "en"), aspects=("9:16",), filename="eng12b",
+    )
+    assert single["voiced_lines"] > 0
+    assert double["tts"] == 2 * single["tts"]
+    assert double["voiced_lines"] == 2 * single["voiced_lines"]
+    assert double["masters"] == 2 * single["masters"]
+    assert double["image"] == single["image"]
+    assert double["video"] == single["video"]
+    assert double["shots"] == single["shots"]
+    assert double["llm"] == single["llm"]
+
+
+# ======================================================================
+# T-MIX-05 (slow): a synthetic 20-minute timeline (300 lines, 40 scenes)
+# mixes and passes QC. Excluded from default CI (-m "not slow"); run on
+# demand with `pytest -m slow`.
+# ======================================================================
+
+
+@pytest.mark.slow
+@pytest.mark.ffmpeg
+async def test_t_mix_05_synthetic_20_minute_timeline_mixes_and_passes_qc(
+    tmp_path,
+):
+    import json
+    import uuid
+
+    from studio.qc.audio import AudioQcInputs, QcSpec, run_audio_qc
+
+    fps = 24
+    rate = SAMPLE_RATE
+    total_samples = 20 * 60 * rate            # 57,600,000
+    total_frames = total_samples // (rate // fps)
+    scene_frames = total_frames // 40         # 30 s each
+
+    # ---- 300 line WAVs, one every 4 s, each 2 s long
+    line_dir = tmp_path / "lines"
+    line_dir.mkdir()
+    placements = []
+    timeline_lines = []
+    cas_paths: dict[str, str] = {}
+    for i in range(300):
+        freq = 220.0 + (i % 12) * 30.0
+        path = line_dir / f"line_{i:03d}.wav"
+        _write_mono_wav(path, freq, 2.0, 0.35)
+        start = i * 4 * rate
+        placements.append((start, 2 * rate))
+        sha = f"sha{i:03d}"
+        cas_paths[sha] = str(path)
+        timeline_lines.append(
+            LinePlacement(
+                f"L{i + 1}", "S", start_sample=start, length_samples=2 * rate,
+                conformed_sha256=sha,
+            )
+        )
+
+    timeline = Timeline(
+        fps=fps, sample_rate=rate,
+        shots=(), scenes=(),
+        lines=tuple(timeline_lines),
+        total_frames=total_frames, total_samples=total_samples,
+        timeline_hash=uuid.uuid4().hex,
+    )
+
+    # ---- stem (stdlib wave; silences between lines)
+    stem = tmp_path / "stem.wav"
+    build_narration_stem(timeline, cas_paths, str(stem))
+    assert stem.stat().st_size == 44 + total_samples * 2
+
+    # ---- library assets: loopable music + ambience, shared paths
+    media = tmp_path / "media"
+    media.mkdir()
+    music = media / "music.flac"
+    music.write_bytes(b"")  # placeholder overwritten by ffmpeg below
+    music_args = ["-f", "lavfi", "-i", "sine=frequency=196:duration=4",
+                  "-c:a", "flac", "-y", str(music)]
+    proc = await run_ffmpeg(["-hide_banner", "-v", "error", *music_args], timeout_s=60)
+    del proc
+    assert music.is_file() and music.stat().st_size > 0
+
+    ambience = media / "ambience.flac"
+    proc = await run_ffmpeg(
+        ["-hide_banner", "-v", "error",
+         "-f", "lavfi", "-i", "anoisesrc=d=4:c=brown:a=0.25",
+         "-c:a", "flac", "-y", str(ambience)],
+        timeout_s=60,
+    )
+    del proc
+    sfx = media / "sfx.flac"
+    proc = await run_ffmpeg(
+        ["-hide_banner", "-v", "error",
+         "-f", "lavfi", "-i", "sine=frequency=880:duration=0.2",
+         "-c:a", "flac", "-y", str(sfx)],
+        timeout_s=60,
+    )
+    del proc
+
+    # ---- 40 music cues (one per scene), 2 ambience beds, 40 sfx sprinkled
+    cues = []
+    library: dict[str, dict] = {}
+    for i in range(40):
+        sha = f"music{i:02d}"
+        library[sha] = {"title": f"Scene {i + 1} tone", "license": "CC0",
+                        "attribution_required": False}
+        cues.append(CueRender(
+            path=str(music), bus="music", loop=True,
+            start_frame=i * scene_frames, end_frame=(i + 1) * scene_frames,
+            source_offset_ms=0, gain_db=-16.0, envelope=None,
+            fade_in_ms=200, fade_out_ms=200,
+        ))
+    library["amb00"] = {"title": "Room tone A", "license": "CC0",
+                        "attribution_required": False}
+    library["amb01"] = {"title": "Room tone B", "license": "CC0",
+                        "attribution_required": False}
+    cues.append(CueRender(
+        path=str(ambience), bus="ambience", loop=True,
+        start_frame=0, end_frame=total_frames,
+        source_offset_ms=0, gain_db=-24.0, envelope=None,
+        fade_in_ms=0, fade_out_ms=0,
+    ))
+    cues.append(CueRender(
+        path=str(ambience), bus="ambience", loop=True,
+        start_frame=0, end_frame=total_frames,
+        source_offset_ms=1500, gain_db=-30.0, envelope=None,
+        fade_in_ms=0, fade_out_ms=0,
+    ))
+    for i in range(40):
+        sha = f"sfx{i:02d}"
+        library[sha] = {"title": f"Tick {i + 1}", "license": "CC0",
+                        "attribution_required": False}
+        start = int((i + 1) * 28.5 * fps)
+        cues.append(CueRender(
+            path=str(sfx), bus="sfx", loop=False,
+            start_frame=start, end_frame=start + 5,
+            source_offset_ms=0, gain_db=-12.0, envelope=None,
+            fade_in_ms=0, fade_out_ms=0,
+        ))
+
+    cue_dicts = []
+
+    for i in range(40):
+        cue_dicts.append({"kind": "music", "library_sha256": f"music{i:02d}",
+                          "start_frame": i * scene_frames,
+                          "end_frame": (i + 1) * scene_frames})
+    cue_dicts.append({"kind": "ambience", "library_sha256": "amb00",
+                      "start_frame": 0, "end_frame": total_frames})
+    cue_dicts.append({"kind": "ambience", "library_sha256": "amb01",
+                      "start_frame": 0, "end_frame": total_frames})
+    for i in range(40):
+        start = int((i + 1) * 28.5 * fps)
+        cue_dicts.append({"kind": "sfx", "library_sha256": f"sfx{i:02d}",
+                          "start_frame": start, "end_frame": start + 5})
+
+    # ---- mix (premaster) then master (two-pass loudnorm)
+    duck = _duck_spec("envelope")
+    mix_dir = tmp_path / "mix"
+    result = await render_premaster(
+        stem_path=stem, cues=cues, duck=duck, placements=placements,
+        total_samples=total_samples, fps=fps, sample_rate=rate,
+        work_dir=mix_dir, emit_music_bus_stems=True,
+    )
+    master = tmp_path / "master.flac"
+    await master_two_pass(
+        result.premaster_path, master,
+        target_lufs=-14.0, true_peak_db=-1.0, lra=11.0,
+        lufs_tolerance=1.0, tp_ceiling_db=-1.0, clip_peak_db=-0.1,
+        sample_rate=rate, total_samples=total_samples, timeout_s=1800.0,
+    )
+
+    # ---- QC over the 20-minute master
+    inputs = AudioQcInputs(
+        deliverable_id="t-mix-05",
+        master_path=str(master),
+        narration_stem_path=str(stem),
+        total_samples=total_samples,
+        sample_rate=rate,
+        placements=placements,
+        cues=cue_dicts,
+        library=library,
+        fps=fps,
+        music_pre_path=str(mix_dir / "music_pre_duck.wav"),
+        music_post_path=str(mix_dir / "music_post_duck.wav"),
+    )
+    spec = QcSpec(
+        min_duck_db=8.0, min_speech_to_music_db=10.0,
+        silent_line_rms_db=-45.0, window_ms=100, exclude_onset_ms=150,
+        target_lufs=-14.0, lufs_tolerance=1.0,
+        tp_ceiling_db=-1.0, clip_peak_db=-0.1,
+    )
+    results = await run_audio_qc(inputs, spec)
+    failures = {r.name: r.detail for r in results if r.status == "fail"}
+    assert not failures, f"QC failures: {json.dumps(failures, default=str)}"

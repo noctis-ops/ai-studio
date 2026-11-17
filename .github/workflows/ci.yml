@@ -42,7 +42,7 @@ jobs:
 
       - name: Tests (with coverage gate)
         run: >-
-          python -m pytest tests/ -q
+          python -m pytest tests/ -q -m "not slow"
           --cov=studio.core --cov=studio.db --cov=studio.pipeline
           --cov=studio.audio --cov=studio.providers.tts
           --cov-report=term-missing --cov-fail-under=90

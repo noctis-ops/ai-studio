@@ -475,7 +475,7 @@ class TtsLineHandler:
                 model_key = parse_voice_settings(voice.settings_json).model_key
             entry = ctx.config.registry.models.get(model_key)
             if entry is not None and entry.tts_params is not None:
-                tts_params = entry.tts_params.model_dump()
+                tts_params = entry.tts_params.model_dump(mode="json")
         except Exception as exc:
             logger.debug("tts params/model resolution failed for line %s: %s", subject.id, exc)
         return _sha(
@@ -1132,9 +1132,9 @@ class AudioPlanHandler:
                 "library": library,
                 "recent_music_uses": recent,
                 "config": {
-                    "levels": settings.audio.levels.model_dump(),
-                    "music": settings.audio.music.model_dump(),
-                    "sfx": settings.audio.sfx.model_dump(),
+                    "levels": settings.audio.levels.model_dump(mode="json"),
+                    "music": settings.audio.music.model_dump(mode="json"),
+                    "sfx": settings.audio.sfx.model_dump(mode="json"),
                 },
                 "mood_affinity": ctx.config.vocab.mood_affinity,
             }
@@ -1309,8 +1309,8 @@ class AudioMixHandler:
                 "plan_hash": plan_hash,
                 "cues": cue_payload,
                 "config": {
-                    "duck": settings.audio.duck.model_dump(),
-                    "master": settings.audio.master.model_dump(),
+                    "duck": settings.audio.duck.model_dump(mode="json"),
+                    "master": settings.audio.master.model_dump(mode="json"),
                     "render_fps": settings.render.fps,
                     "sample_rate": settings.audio.sample_rate,
                 },
