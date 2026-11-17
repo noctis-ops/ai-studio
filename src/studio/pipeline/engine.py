@@ -29,6 +29,7 @@ from studio.db.repos.pipeline import subject_from_stage_run
 from studio.domain.enums import RunStatus
 from studio.domain.errors import (
     BudgetExceeded,
+    ProviderQuotaExceeded,
     StudioError,
     TransientProviderError,
 )
@@ -107,8 +108,36 @@ class Engine:
             resolved = self.config.registry.resolve_llm_subset(run.profile)
         else:
             resolved = self.config.registry.resolve_profile(run.profile)
+        # Per-episode overrides (the `studio run --languages/--aspects` selection
+        # is persisted on the episode at seed time) win over the settings
+        # defaults; fall back to settings for series-setup runs.
         languages = resolve_languages(settings)
         aspects = list(settings.aspects)
+        if run.episode_id:
+            episode = self.repos.content.get_episode(run.episode_id)
+            if episode is not None:
+                try:
+                    episode_languages = json.loads(episode.languages_json)
+                except (TypeError, json.JSONDecodeError):
+                    episode_languages = None
+                if isinstance(episode_languages, list) and episode_languages:
+                    languages = resolve_languages(settings, episode_languages)
+                try:
+                    episode_aspects = json.loads(episode.aspects_json)
+                except (TypeError, json.JSONDecodeError):
+                    episode_aspects = None
+                if isinstance(episode_aspects, list) and episode_aspects:
+                    from studio.domain.enums import Aspect
+
+                    seen: set[str] = set()
+                    resolved_aspects = []
+                    for item in episode_aspects:
+                        value = str(item)
+                        if value in seen:
+                            continue
+                        seen.add(value)
+                        resolved_aspects.append(Aspect(value))
+                    aspects = resolved_aspects
         return RunContext(
             db=self.db,
             repos=self.repos,
@@ -420,6 +449,15 @@ class Engine:
         if run is None:
             self.repos.jobs.complete(job.id)
             return
+        if run.status not in (RunStatus.RUNNING.value, RunStatus.AWAITING_APPROVAL.value):
+            # A halted/failed/completed run must not spend: jobs enqueued
+            # before the halt are dropped on the floor.
+            logger.info(
+                "run_stage skipped: run %s is %s (refusing to execute %s)",
+                run.id, run.status, row.stage,
+            )
+            self.repos.jobs.complete(job.id)
+            return
         spec = self.dag.spec(row.stage)
         handler = spec.handler
         subject = subject_from_stage_run(row)
@@ -448,6 +486,9 @@ class Engine:
             raise  # not caught: state left as a killed process would leave it
         except BudgetExceeded as exc:
             await self._budget_halt(job, row, run, exc)
+            return
+        except ProviderQuotaExceeded as exc:
+            await self._quota_halt(job, row, run, exc)
             return
         except TransientProviderError as exc:
             await self._transient_failure(job, row, run, exc)
@@ -498,6 +539,29 @@ class Engine:
             payload={"run_id": run.id, "stage_run_id": row.id, "error": str(exc)[:500]},
         )
         logger.warning("run %s halted on budget: %s", run.id, exc)
+
+    async def _quota_halt(
+        self, job: JobRow, row: StageRunRow, run: PipelineRunRow, exc: ProviderQuotaExceeded
+    ) -> None:
+        # Same shape as a budget halt: stage back to pending, run halted_budget,
+        # audit with reason provider_quota, never retried.
+        self.repos.pipeline.set_stage_run(row.id, status="pending")
+        self.repos.pipeline.set_run_status(run.id, RunStatus.HALTED_BUDGET.value)
+        if run.episode_id:
+            self.repos.content.set_episode_status(run.episode_id, RunStatus.HALTED_BUDGET.value)
+        self.repos.jobs.complete(job.id)
+        self.repos.audit.append(
+            actor="engine",
+            entity=f"run:{run.id}",
+            event="budget_halted",
+            payload={
+                "run_id": run.id,
+                "stage_run_id": row.id,
+                "error": str(exc)[:500],
+                "reason": "provider_quota",
+            },
+        )
+        logger.warning("run %s halted on provider quota: %s", run.id, exc)
 
     async def _transient_failure(
         self, job: JobRow, row: StageRunRow, run: PipelineRunRow, exc: TransientProviderError

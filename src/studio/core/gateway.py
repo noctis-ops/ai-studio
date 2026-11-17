@@ -291,7 +291,7 @@ class ProviderGateway:
                 if already_submitted:
                     handle = JobHandle(remote_request_id=str(remote_request_id))
                 else:
-                    limiter = self._limiter(entry.provider)
+                    limiter = self._limiter(entry.provider, entry)
                     async with limiter:
                         handle = await self._submit_job(call_id, kind, provider, req)
                 await self._poll_until_done(provider, handle)
@@ -305,7 +305,7 @@ class ProviderGateway:
                     assets=refs, inline_json=None, cost_musd=actual, provider_call_id=call_id
                 )
 
-            limiter = self._limiter(entry.provider)
+            limiter = self._limiter(entry.provider, entry)
             async with limiter:
                 result = await self._submit_single(call_id, kind, provider, req)
             return await self._finish_single(kind, call_id, est, entry, req, result)
@@ -357,6 +357,13 @@ class ProviderGateway:
         provider: Any,
         req: LLMRequest | TTSRequest | MediaRequest,
     ) -> LLMResult | TTSResult:
+        # D2 (Phase 3): persist the submit marker with a single statement before
+        # the provider is invoked, so a crash mid-HTTP-call leaves a row whose
+        # submit_started_at is set (mirrors the job-provider path). Resume then
+        # reuses the reservation and logs a potential_orphan audit event.
+        await asyncio.to_thread(self._providers_repo.mark_submit_started, call_id)
+        self.faults.crash_at("before_submit")
+
         async def op() -> LLMResult | TTSResult:
             await asyncio.to_thread(self._providers_repo.bump_attempt, call_id)
             if kind == "llm":
@@ -376,6 +383,8 @@ class ProviderGateway:
             sleep=self._sleep,
             rng=self._rng,
         )
+        # D2: the response has been received but nothing has been stored yet.
+        self.faults.crash_at("during_single_call")
         return result
 
     async def _poll_until_done(self, provider: Any, handle: JobHandle) -> None:
@@ -471,11 +480,19 @@ class ProviderGateway:
             finally:
                 if tmp_download is not None:
                     tmp_download.unlink(missing_ok=True)
+        # D2: single-call equivalent of the job-provider "after the asset was
+        # stored but before complete_call" point (the response bytes, if any,
+        # are in the CAS / memory but nothing is settled yet).
+        self.faults.crash_at("after_store_before_complete")
         actual = actual_cost_musd(entry, req, result)
         cache_rows = self._cache_rows(
             call_id, entry, req, refs, inline_json=inline_json, actual=actual
         )
         await asyncio.to_thread(self.ledger.complete_call, call_id, actual, cache_rows)
+        # Phase 3 (H1): stash the provider request id for dashboard reconciliation.
+        request_id = getattr(result, "meta", {}).get("request_id") if kind == "tts" else None
+        if isinstance(request_id, str) and request_id:
+            await asyncio.to_thread(self._providers_repo.set_remote_request_id, call_id, request_id)
         return GatewayResult(
             assets=refs, inline_json=inline_json, cost_musd=actual, provider_call_id=call_id
         )
@@ -537,10 +554,13 @@ class ProviderGateway:
         self._provider_cache[model_key] = instance
         return instance
 
-    def _limiter(self, provider_name: str) -> ProviderLimiter:
+    def _limiter(self, provider_name: str, entry: ModelEntry | None = None) -> ProviderLimiter:
         limiter = self._limiters.get(provider_name)
         if limiter is None:
             cfg = self.registry.limits.get(provider_name)
+            if cfg is None and entry is not None and entry.limits is not None:
+                # Fall back to entry-level limits (Phase 3 registry entries).
+                cfg = entry.limits
             max_concurrency = (
                 cfg.max_concurrency
                 if cfg is not None

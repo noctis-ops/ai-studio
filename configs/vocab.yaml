@@ -28,3 +28,34 @@ camera_moves:
   - orbit
 
 intensity: [1, 2, 3, 4, 5]
+
+sfx_tags:
+  - whoosh
+  - impact
+  - chime
+  - transition
+  - swoosh
+  - click
+  - pop
+  - shimmer
+
+ambience_tags:
+  - rain
+  - crowd
+  - room_tone
+  - wind
+  - night_city
+  - forest
+  - waves
+  - fire
+
+# Optional affinity map (0..1); used by the Phase 3 music selector for mood neighbors.
+mood_affinity:
+  adventurous: {determined: 0.6, awe: 0.5}
+  tense: {somber: 0.5, determined: 0.4}
+  melancholic: {somber: 0.7, hopeful: 0.3}
+  hopeful: {adventurous: 0.5, awe: 0.4}
+  awe: {hopeful: 0.4, melancholic: 0.3}
+  humorous: {adventurous: 0.4, hopeful: 0.3}
+  somber: {melancholic: 0.7, tense: 0.4}
+  determined: {adventurous: 0.6, tense: 0.4}

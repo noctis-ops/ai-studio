@@ -58,6 +58,21 @@ class PerSecond(BaseModel):
 Pricing = Annotated[Per1mTokens | Per1kChars | PerImage | PerSecond, Field(discriminator="unit")]
 
 
+class ProviderLimit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_concurrency: int = Field(default=1, ge=1)
+    min_interval_s: float = Field(default=0.0, ge=0)
+
+
+class TtsParams(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    output_format: str = "mp3_44100_128"
+    supports_context: bool = False
+    supports_language_code: bool = False
+
+
 class ModelEntry(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -76,6 +91,9 @@ class ModelEntry(BaseModel):
     pricing_acknowledged_free: bool = False
     param_map: dict[str, str] = {}
     needs_confirmation: bool = False
+    # Phase 3: optional TTS-specific knobs (kept extra="forbid" elsewhere).
+    tts_params: TtsParams | None = None
+    limits: ProviderLimit | None = None
 
     @property
     def model_ref(self) -> str:
@@ -90,13 +108,6 @@ class ModelEntry(BaseModel):
         if isinstance(self.pricing, Per1mTokens):
             return self.pricing.in_usd == ZERO and self.pricing.out_usd == ZERO
         return self.pricing.usd == ZERO
-
-
-class ProviderLimit(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    max_concurrency: int = Field(default=1, ge=1)
-    min_interval_s: float = Field(default=0.0, ge=0)
 
 
 class RegistryFile(BaseModel):

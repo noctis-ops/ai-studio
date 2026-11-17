@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import sqlite3
@@ -17,12 +18,12 @@ from rich.console import Console
 from rich.table import Table
 
 from studio.config.loader import AppConfig, load_all
-from studio.core.clock import SystemClock
+from studio.core.clock import SystemClock, format_ts
 from studio.core.ids import UlidIds
 from studio.db import build_repos, migrate
 from studio.db.connection import Database
 from studio.db.repos import StudioRepos
-from studio.domain.enums import BudgetScope, Profile
+from studio.domain.enums import BudgetScope, Language, Profile
 from studio.domain.errors import RegistryError, StudioError
 from studio.domain.money import musd_to_usd, usd_to_musd
 from studio.pipeline.dag import Dag
@@ -33,7 +34,10 @@ from studio.pipeline.worker import Worker
 
 app = typer.Typer(
     add_completion=False,
-    help="AI Studio — Phase 2 (demo pipeline on mocks; operator-gated paid LLM subset).",
+    help=(
+        "AI Studio — Phase 3 (demo pipeline on mocks incl. the local audio engine; "
+        "operator-gated paid LLM subset)."
+    ),
 )
 db_app = typer.Typer(help="Database commands.")
 gates_app = typer.Typer(help="Human approval gates.")
@@ -41,6 +45,10 @@ budget_app = typer.Typer(help="Budget ledger.")
 app.add_typer(db_app, name="db")
 app.add_typer(gates_app, name="gates")
 app.add_typer(budget_app, name="budget")
+voice_app = typer.Typer(help="Character voices (TTS).")
+narration_app = typer.Typer(help="Narration lines (post-Gate-1 edits).")
+app.add_typer(voice_app, name="voice")
+app.add_typer(narration_app, name="narration")
 
 console = Console()
 err_console = Console(stderr=True)
@@ -224,6 +232,38 @@ def doctor(
     checks.append(("ffmpeg on PATH", "PASS" if ffmpeg else "FAIL", ffmpeg or "not found"))
     ffprobe = _which("ffprobe")
     checks.append(("ffprobe on PATH", "PASS" if ffprobe else "FAIL", ffprobe or "not found"))
+
+    # D3: version >= 5.0 + the exact audio filter set Phase 3 relies on.
+    # Uses the same helper as tests/test_ffmpeg_capabilities.py.
+    try:
+        from studio.video.ffmpeg import REQUIRED_FILTERS, capability_check
+
+        # Timeout is config-driven, but the check must still run when config
+        # itself is broken — fall back to the schema default (30s).
+        timeout_s = 30.0
+        try:
+            timeout_s = float(load_all(_home()).settings.doctor.probe_timeout_s)
+        except Exception as cfg_exc:  # config broken — still probe, default timeout
+            timeout_s = 30.0
+            _ = cfg_exc
+        ff_version, missing = asyncio.run(asyncio.wait_for(capability_check(), timeout=timeout_s))
+        version_ok = ff_version >= (5, 0, 0)
+        checks.append(
+            (
+                "ffmpeg >= 5.0",
+                "PASS" if version_ok else "FAIL",
+                ".".join(str(part) for part in ff_version),
+            )
+        )
+        checks.append(
+            (
+                "ffmpeg audio filters",
+                "PASS" if not missing else "FAIL",
+                ", ".join(missing) if missing else f"{len(set(REQUIRED_FILTERS))} filters present",
+            )
+        )
+    except Exception as exc:
+        checks.append(("ffmpeg capability check", "FAIL", str(exc)[:200]))
 
     # Phase 2: both LLM registry entries must be verified (dates shown).
     checks.extend(_llm_registry_rows())
@@ -707,6 +747,212 @@ def budget_reset(
     except StudioError as exc:
         _fail(str(exc))
     console.print(f"kill switch reset for {scope_enum.value}:{ref}")
+
+
+# ==================================================================
+# voice / narration (Phase 3)
+# ==================================================================
+
+def _resolve_series(repos: StudioRepos, series_ref: str) -> Any:
+    series = repos.content.get_series(series_ref)
+    if series is None:
+        series = repos.content.get_series_by_slug(series_ref)
+    if series is None:
+        _fail(f"series not found: {series_ref!r} (pass a series id or slug)")
+    return series
+
+
+@voice_app.command("set")
+def voice_set(
+    character_slug: str = typer.Argument(..., help="Character slug (matched on characters.role)."),
+    series: str = typer.Option(..., "--series", help="Series id or slug."),
+    language: str = typer.Option(..., "--language", help="ar | en"),
+    voice_id: str = typer.Option(..., "--voice-id", help="Provider voice id (never logged)."),
+    model_key: str = typer.Option(
+        "tts.main", "--model-key", help="Registry key for the TTS model."
+    ),
+    stability: float | None = typer.Option(None, "--stability", min=0.0, max=1.0),
+    similarity_boost: float | None = typer.Option(None, "--similarity-boost", min=0.0, max=1.0),
+    style: float | None = typer.Option(None, "--style", min=0.0, max=1.0),
+    speaker_boost: bool | None = typer.Option(
+        None, "--speaker-boost/--no-speaker-boost", help="Maps to ElevenLabs use_speaker_boost."
+    ),
+    speed: float | None = typer.Option(None, "--speed", help="Provider speech speed (> 0)."),
+    mix_gain_db: float = typer.Option(
+        0.0, "--mix-gain-db", help="Extra line gain applied at conform."
+    ),
+    attest_commercial: bool = typer.Option(
+        False, "--attest-commercial",
+        help="Stamp the commercial-use attestation (required for final).",
+    ),
+) -> None:
+    """Upsert the voice for (character, language) in a series."""
+    config, db, clock, _ids, repos = _connect()
+    migrate(db)
+    series_row = _resolve_series(repos, series)
+    character = repos.content.get_character_by_slug(series_row.id, character_slug)
+    if character is None:
+        _fail(
+            f"no character with role/slug {character_slug!r} in series {series_row.slug!r}; "
+            f"create it first (the demo seed creates 'narrator')"
+        )
+    try:
+        language_enum = Language(language.strip())
+    except ValueError:
+        _fail(f"unknown language {language!r} (allowed: ar, en)")
+    if config.registry.models.get(model_key) is None:
+        _fail(f"unknown model_key {model_key!r} in model_registry.yaml")
+
+    from studio.audio.voice import VoiceSettings, parse_voice_settings, voice_settings_json
+
+    existing = repos.audio.get_character_voice(
+        series_id=series_row.id, character_slug=character_slug, language=language_enum.value
+    )
+    attested_at = format_ts(clock.now()) if attest_commercial else (
+        parse_voice_settings(existing.settings_json).license_attested_at if existing else None
+    )
+    settings = VoiceSettings(
+        model_key=model_key,
+        stability=stability,
+        similarity_boost=similarity_boost,
+        style=style,
+        speaker_boost=speaker_boost,
+        speed=speed,
+        mix_gain_db=mix_gain_db,
+        license_attested_at=attested_at,
+    )
+    repos.audio.upsert_character_voice(
+        series_id=series_row.id,
+        character_slug=character_slug,
+        language=language_enum.value,
+        voice_id=voice_id,
+        settings_json=voice_settings_json(settings),
+    )
+    console.print(f"voice set: series={series_row.slug} character={character_slug} "
+                  f"language={language_enum.value} voice_id={voice_id} model={model_key}")
+    console.print(f"attestation: {attested_at or 'none'}")
+
+
+@voice_app.command("list")
+def voice_list(
+    series: str = typer.Option(..., "--series", help="Series id or slug."),
+) -> None:
+    """List voices in a series."""
+    config, db, clock, ids, repos = _connect()
+    migrate(db)
+    del config, clock, ids
+    from studio.audio.voice import parse_voice_settings
+
+    series_row = _resolve_series(repos, series)
+    table = Table(title=f"voices in {series_row.slug}")
+    for column in ("character", "language", "voice_id", "model_key", "mix_gain_db", "attested"):
+        table.add_column(column)
+    rows = repos.audio.list_character_voices(series_id=series_row.id)
+    if not rows:
+        console.print("no voices set")
+        return
+    for row in rows:
+        try:
+            settings = parse_voice_settings(row.settings_json)
+        except StudioError:
+            settings = None
+        if settings is None:
+            table.add_row(row.character_slug, row.language, row.voice_id, "INVALID", "-", "INVALID")
+        else:
+            table.add_row(
+                row.character_slug,
+                row.language,
+                row.voice_id,
+                settings.model_key,
+                f"{settings.mix_gain_db:+.1f}",
+                settings.license_attested_at or "never",
+            )
+    console.print(table)
+
+
+@narration_app.command("show")
+def narration_show(
+    episode: str = typer.Argument(..., help="Episode id."),
+) -> None:
+    """Show narration lines per deliverable (text, voicing state)."""
+    config, _db, clock, ids, repos = _connect()
+    del clock, ids
+    episode_row = repos.content.get_episode(episode)
+    if episode_row is None:
+        _fail(f"episode not found: {episode}")
+    tracks = {t.id: t for t in repos.content.list_tracks(episode_row.id)}
+    deliverables = repos.content.list_deliverables(episode_row.id)
+    shot_no = {
+        s.id: s.shot_no for t in tracks.values() for s in repos.content.shots_for_track(t.id)
+    }
+    for deliverable in deliverables:
+        console.print(
+            f"[bold]deliverable {deliverable.id}[/bold]  track={deliverable.track_id} "
+            f"language={deliverable.language}"
+        )
+        lines = repos.content.narration_lines(deliverable.id)
+        table = Table()
+        for column in ("shot", "line", "status", "conf_ms", "nonce", "text"):
+            table.add_column(column)
+        for line in lines:
+            conf_ms = (
+                round(line.conformed_samples / config.settings.audio.sample_rate * 1000)
+                if line.conformed_samples is not None
+                else None
+            )
+            text = line.approved_text.replace("\n", " ")
+            if len(text) > 80:
+                text = text[:77] + "…"
+            table.add_row(
+                str(shot_no.get(line.shot_id, "?")),
+                str(line.line_no),
+                line.status,
+                str(conf_ms) if conf_ms is not None else "—",
+                line.tts_nonce,
+                text,
+            )
+        console.print(table)
+
+
+@narration_app.command("edit")
+def narration_edit(
+    line_id: str = typer.Argument(..., help="Narration line id."),
+    text: str | None = typer.Option(None, "--text", help="Replacement text (UTF-8)."),
+    file: Path | None = typer.Option(None, "--file", help="UTF-8 file with the replacement text."),  # noqa: B008
+) -> None:
+    """Edit a line's text after Gate 1 (audit row, nonce unchanged)."""
+    if (text is None) == (file is None):
+        _fail("pass exactly one of --text or --file")
+    if text is not None:
+        new_text = text.strip()
+    else:
+        assert file is not None
+        new_text = file.read_text(encoding="utf-8").strip()
+    if not new_text:
+        _fail("replacement text is empty")
+    config, _db, clock, ids, repos = _connect()
+    del config, clock, ids
+    line = repos.content.get_narration_line(line_id)
+    if line is None:
+        _fail(f"narration line not found: {line_id}")
+    old_text = line.approved_text
+    if old_text == new_text:
+        console.print("no change")
+        return
+    repos.content.set_line_text_final(line_id, new_text)
+    repos.audit.append(
+        actor="operator",
+        entity=f"narration_line:{line_id}",
+        event="post_gate_edit",
+        payload={
+            "line_id": line_id,
+            "old_text_sha256": hashlib.sha256(old_text.encode("utf-8")).hexdigest(),
+            "new_text_sha256": hashlib.sha256(new_text.encode("utf-8")).hexdigest(),
+        },
+    )
+    console.print(
+        f"line {line_id} updated; run `studio resume <run-id>` to re-voice only this line"
+    )
 
 
 # ==================================================================

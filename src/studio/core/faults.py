@@ -19,6 +19,9 @@ CRASH_POINTS = (
     "during_poll",
     "after_fetch_before_store",
     "after_store_before_complete",
+    # D2 (Phase 3): single-call providers (LLM, TTS) crash once the response has
+    # been received but before it is persisted/stored.
+    "during_single_call",
 )
 
 _FOREVER = 10**9

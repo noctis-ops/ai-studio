@@ -76,6 +76,10 @@ class TTSResult(BaseModel):
 
     payload: MediaPayload
     billed_chars: int
+    # Provider-reported bookkeeping (never a secret): ElevenLabs `request-id`
+    # so the gateway can store it on provider_calls.remote_request_id after
+    # completion for dashboard reconciliation.
+    meta: dict[str, Any] = {}
 
 
 class MediaRequest(BaseModel):

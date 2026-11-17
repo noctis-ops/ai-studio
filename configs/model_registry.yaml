@@ -25,11 +25,32 @@ models:
   tts.main:
     provider: elevenlabs
     capability: tts
-    model_id: "<CONFIRM_CURRENT_ID>"          # must support Arabic (Fusha) + English
-    pricing: {unit: per_1k_chars, usd: 0.0}
+    model_id: "eleven_multilingual_v2"      # ⚠ believed current and Arabic-capable; confirm via audition
+    pricing: {unit: per_1k_chars, usd: 0.30} # ⚠ PROVISIONAL worst case. Derive: (plan $ / included credits) x 1000
+                                             #   x model credit-per-char multiplier; use the higher of included vs overage rate
+    pricing_verified_on: null                # set to a date once verified
+    commercial_use_verified: true
+    commercial_use_note: "Operator attestation: ElevenLabs Creator plan. Re-verify, and check each voice's own terms."
+    tts_params: {output_format: "mp3_44100_128", supports_context: true, supports_language_code: false}
+    limits: {max_concurrency: 1, min_interval_s: 0.5}
+    needs_confirmation: true
+  tts.candidate.flash:                       # audition-only, not referenced by any profile
+    provider: elevenlabs
+    capability: tts
+    model_id: "eleven_flash_v2_5"            # ⚠
+    pricing: {unit: per_1k_chars, usd: 0.15} # ⚠ provisional
     pricing_verified_on: null
     commercial_use_verified: true
-    commercial_use_note: "Operator confirmed 2026-11-09: ElevenLabs Creator Plan, commercial license included, no attribution required."
+    tts_params: {output_format: "mp3_44100_128", supports_context: false, supports_language_code: true}
+    needs_confirmation: true
+  tts.candidate.v3:                          # audition-only
+    provider: elevenlabs
+    capability: tts
+    model_id: "eleven_v3"                    # ⚠
+    pricing: {unit: per_1k_chars, usd: 0.30} # ⚠ provisional
+    pricing_verified_on: null
+    commercial_use_verified: true
+    tts_params: {output_format: "mp3_44100_128", supports_context: false, supports_language_code: false}
     needs_confirmation: true
   image.keyframe:
     provider: fal

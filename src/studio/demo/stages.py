@@ -3,7 +3,7 @@ all handlers are idempotent.
 
 Stages (BEGIN_PROMPT §H8):
     demo_script     episode      -> llm (demo_shots) -> creates shots per track
-    demo_voice      deliverable  -> tts per shot (deliverable's language)
+    demo_voice      deliverable  -> materializes narration_lines (Phase 3: TTS moved to s5_tts)
     demo_keyframes  shot         -> image per shot (current shot_attempts nonce)
     demo_clips      shot         -> video per shot (keyframe + narration duration)
     demo_finalize   deliverable  -> manifest JSON asset
@@ -24,12 +24,18 @@ if TYPE_CHECKING:
 
 from studio.core.canonical import canonical_json
 from studio.core.gateway import CallContext
-from studio.demo.seed import narrator_voice
-from studio.domain.enums import Aspect, GateKind, Language, Scope
+from studio.domain.enums import Aspect, GateKind, Scope
 from studio.domain.errors import PermanentProviderError
 from studio.domain.refs import AssetRef, SubjectRef
 from studio.pipeline.stage import StageOutput, StageSpec
-from studio.providers.base import LLMRequest, MediaRequest, TTSRequest
+from studio.pipeline.stages_audio import (
+    AudioMixHandler,
+    AudioPlanHandler,
+    TimingReconcilerHandler,
+    TtsLineHandler,
+    TtsPreflightHandler,
+)
+from studio.providers.base import LLMRequest, MediaRequest
 
 _SCRIPT_SCHEMA = "demo_shots"
 _MANIFEST_VERSION = 1
@@ -117,6 +123,36 @@ def narration_text(shot: ShotRow) -> str:
 # ==================================================================
 
 
+def _ensure_scenes(ctx: RunContext, track_id: str) -> None:
+    """Backfill deterministic demo scenes (idempotent).
+
+    Phase 2 never created scene rows; Phase 3's S7 audio plan needs them for
+    music segmentation. One scene per shot: the first two shots are
+    'hopeful'/intensity 2 with room tone, the rest 'tense'/intensity 4 with
+    wind. Tags match the generated demo library (demo/library.py).
+    """
+    if ctx.repos.content.list_scenes(track_id):
+        return
+    shots = sorted(
+        ctx.repos.content.shots_for_track(track_id), key=lambda shot: shot.shot_no
+    )
+    for shot in shots:
+        if shot.shot_no <= 2:
+            mood, intensity, tags = "hopeful", 2, ["room_tone"]
+        else:
+            mood, intensity, tags = "tense", 4, ["wind"]
+        ctx.repos.content.upsert_scene(
+            track_id=track_id,
+            scene_no=shot.shot_no,
+            shot_from=shot.shot_no,
+            shot_to=shot.shot_no,
+            music_mood=mood,
+            intensity=intensity,
+            ambience_tags_json=json.dumps(tags),
+        )
+
+
+
 class DemoScriptHandler:
     def subjects(self, ctx: RunContext) -> list[SubjectRef]:
         episode = _episode(ctx)
@@ -158,6 +194,8 @@ class DemoScriptHandler:
 
         existing = ctx.repos.content.list_shots(episode.id)
         if existing:
+            for track in tracks:
+                _ensure_scenes(ctx, track.id)
             return StageOutput(
                 output={
                     "episode_id": episode.id,
@@ -203,6 +241,8 @@ class DemoScriptHandler:
                     prompt=str(item.get("prompt", "")).strip() or "untitled shot",
                 )
                 created += 1
+        for track in tracks:
+            _ensure_scenes(ctx, track.id)
         return StageOutput(
             output={
                 "episode_id": episode.id,
@@ -219,27 +259,31 @@ class DemoScriptHandler:
 
 
 class DemoVoiceHandler:
+    """Materialize `narration_lines` rows for the episode (Phase 2 role).
+
+    Phase 3 note: actual synthesis happens in `s5_tts` (LINE scope, mock TTS
+    in sandbox). This stage no longer synthesizes anything; it exists so the
+    narration text exists as rows for the voicer — the demo analog of the
+    production S3 materialization. Kept as a stage so Phase 2 pipeline tests
+    (stage set, staleness graph) remain valid.
+    """
+
     def subjects(self, ctx: RunContext) -> list[SubjectRef]:
         return _deliverable_subjects(ctx)
 
     def input_hash(self, ctx: RunContext, subject: SubjectRef) -> str:
         deliverable = ctx.repos.content.get_deliverable(subject.id)
         assert deliverable is not None
-        episode = _episode(ctx)
-        assert episode is not None
         shots = sorted(
             ctx.repos.content.shots_for_track(deliverable.track_id),
             key=lambda s: s.shot_no,
         )
-        voice = narrator_voice(ctx.repos, episode.series_id, Language(deliverable.language))
         return _sha(
             {
                 "stage": "demo_voice",
                 "deliverable_id": subject.id,
                 "language": deliverable.language,
                 "channel_id": deliverable.channel_id,
-                "voice": voice,
-                "tts": ctx.resolved_profile.model_key_for("tts"),
                 "lines": [
                     {"shot_id": s.id, "shot_no": s.shot_no, "text": narration_text(s)}
                     for s in shots
@@ -251,60 +295,35 @@ class DemoVoiceHandler:
         deliverable = ctx.repos.content.get_deliverable(subject.id)
         if deliverable is None:
             raise PermanentProviderError(f"deliverable not found: {subject.id}")
-        episode = _episode(ctx)
-        assert episode is not None
-        voice = narrator_voice(ctx.repos, episode.series_id, Language(deliverable.language))
-        model_key = ctx.resolved_profile.model_key_for("tts")
         shots = sorted(
             ctx.repos.content.shots_for_track(deliverable.track_id),
             key=lambda s: s.shot_no,
         )
-        asset_shas: list[str] = []
         written = 0
-        for index, shot in enumerate(shots):
+        for shot in shots:
+            existing = [
+                line
+                for line in ctx.repos.content.narration_lines_for_shot(shot.id)
+                if line.deliverable_id == deliverable.id
+            ]
+            if existing:
+                continue
             text = narration_text(shot)
-            for line in ctx.repos.content.narration_lines_for_shot(shot.id):
-                if line.deliverable_id == deliverable.id and line.asset_sha256:
-                    asset_shas.append(line.asset_sha256)
-                    written += 1
-                    break
-            else:
-                previous_text = narration_text(shots[index - 1]) if index > 0 else None
-                next_text = narration_text(shots[index + 1]) if index + 1 < len(shots) else None
-                result = await ctx.gateway.tts(
-                    model_key,
-                    TTSRequest(
-                        text=text,
-                        voice_id=voice,
-                        language=Language(deliverable.language),
-                        settings={"stability": 0.5, "similarity_boost": 0.75},
-                        previous_text=previous_text,
-                        next_text=next_text,
-                    ),
-                    CallContext(
-                        episode_id=ctx.episode_id,
-                        stage_run_id=ctx.stage_run_id,
-                        nonce="0",
-                        purpose="narration",
-                    ),
-                )
-                asset = result.assets[0]
-                ctx.repos.content.upsert_narration_line(
-                    deliverable_id=deliverable.id,
-                    shot_id=shot.id,
-                    line_no=shot.shot_no,
-                    text=text,
-                    asset_sha256=asset.sha256,
-                    duration_ms=asset.duration_ms,
-                )
-                asset_shas.append(asset.sha256)
-                written += 1
+            ctx.repos.content.upsert_narration_line(
+                deliverable_id=deliverable.id,
+                shot_id=shot.id,
+                line_no=shot.shot_no,
+                text=text,
+                asset_sha256=None,
+                duration_ms=None,
+            )
+            written += 1
         return StageOutput(
             output={
                 "deliverable_id": deliverable.id,
                 "language": deliverable.language,
-                "lines": written,
-                "asset_sha256s": asset_shas,
+                "lines_materialized": written,
+                "lines": len(shots),
             }
         )
 
@@ -619,6 +638,41 @@ def demo_specs() -> list[StageSpec]:
             gate_after=None,
         ),
         StageSpec(
+            name="s5a_tts_preflight",
+            scope=Scope.EPISODE,
+            depends_on=("demo_script",),
+            handler=TtsPreflightHandler(),
+            gate_after=None,
+        ),
+        StageSpec(
+            name="s5_tts",
+            scope=Scope.LINE,
+            depends_on=("s5a_tts_preflight", "demo_voice"),
+            handler=TtsLineHandler(),
+            gate_after=None,
+        ),
+        StageSpec(
+            name="s6_timing",
+            scope=Scope.TRACK,
+            depends_on=("s5_tts",),
+            handler=TimingReconcilerHandler(),
+            gate_after=None,
+        ),
+        StageSpec(
+            name="s7_audio_plan",
+            scope=Scope.DELIVERABLE,
+            depends_on=("s6_timing",),
+            handler=AudioPlanHandler(),
+            gate_after=None,
+        ),
+        StageSpec(
+            name="s7b_audio_mix",
+            scope=Scope.DELIVERABLE,
+            depends_on=("s7_audio_plan", "s5_tts"),
+            handler=AudioMixHandler(),
+            gate_after=None,
+        ),
+        StageSpec(
             name="demo_keyframes",
             scope=Scope.SHOT,
             depends_on=("demo_script",),
@@ -628,7 +682,7 @@ def demo_specs() -> list[StageSpec]:
         StageSpec(
             name="demo_clips",
             scope=Scope.SHOT,
-            depends_on=("demo_keyframes", "demo_voice"),
+            depends_on=("demo_keyframes", "s6_timing"),
             handler=DemoClipsHandler(),
             gate_after=None,
         ),

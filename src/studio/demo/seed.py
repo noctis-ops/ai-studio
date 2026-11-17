@@ -6,12 +6,15 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from studio.config.channels import channel_for
 from studio.config.languages import resolve_languages
 from studio.config.loader import AppConfig
+from studio.core.clock import format_ts
 from studio.core.ids import Ids, UlidIds
 from studio.db.repos import StudioRepos
+from studio.demo.library import ensure_demo_library
 from studio.domain.enums import Aspect, Language
 
 _DEMO_TITLE = "Studio Demo — The Lantern"
@@ -71,6 +74,28 @@ def seed_demo(
         name="Narrator",
         voices_json=json.dumps(narrator_voices, sort_keys=True, separators=(",", ":")),
     )
+    # Phase 3: seed character_voices so the sandbox runs the real audio chain
+    # (mock TTS via the mock.tts registry entry). Attestation stamped so the
+    # demo is also valid for attestation checks; model_key pins the mock
+    # provider (never the placeholder real entries).
+    attested_at = format_ts(datetime.now(UTC))
+    for language in resolved_languages:
+        repos.audio.upsert_character_voice(
+            series_id=series.id,
+            character_slug=narrator.role,
+            language=language.value,
+            voice_id=f"mock-voice-{language.value}",
+            settings_json=json.dumps(
+                {
+                    "model_key": "mock.tts",
+                    "stability": 0.5,
+                    "similarity_boost": 0.75,
+                    "license_attested_at": attested_at,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
     episode = repos.content.create_episode(
         series_id=series.id,
         title=_DEMO_TITLE,
@@ -90,6 +115,9 @@ def seed_demo(
                 track_id=track.id, language=language.value, channel_id=channel_id
             )
             deliverable_ids.append(deliverable.id)
+    # Phase 3: generate the sandbox audio library (fixture WAVs + index
+    # sidecars) and upsert the rows, so S7 has an active library to plan with.
+    ensure_demo_library(config, repos)
     return SeedResult(
         series_id=series.id,
         episode_id=episode.id,

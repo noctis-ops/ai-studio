@@ -50,9 +50,16 @@ class Dag:
 
     @staticmethod
     def _toposort(specs: list[StageSpec]) -> list[StageSpec]:
+        """Deterministic topological order.
+
+        Always emits the lowest-indexed ready stage (rather than appending
+        whole waves) so the result respects declaration order among
+        independent branches; the engine relies on this to enumerate
+        cheaper, already-declared stages before later gated ones.
+        """
         index = {spec.name: i for i, spec in enumerate(specs)}
         indegree = {spec.name: len(spec.depends_on) for spec in specs}
-        remaining = {spec.name for spec in specs}
+        remaining = set(index)
         by_name = {spec.name: spec for spec in specs}
         ordered: list[StageSpec] = []
         while remaining:
@@ -60,12 +67,12 @@ class Dag:
             if not ready:
                 cycle = ", ".join(sorted(remaining))
                 raise ConfigError(f"stage dependency cycle involving: {cycle}")
-            for name in ready:
-                ordered.append(by_name[name])
-                remaining.remove(name)
-                for other in specs:
-                    if name in other.depends_on:
-                        indegree[other.name] -= 1
+            name = ready[0]
+            ordered.append(by_name[name])
+            remaining.remove(name)
+            for other in specs:
+                if name in other.depends_on:
+                    indegree[other.name] -= 1
         return ordered
 
     @staticmethod

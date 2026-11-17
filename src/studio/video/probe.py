@@ -20,6 +20,7 @@ class ProbeResult:
     height: int | None
     fps: float | None
     has_audio: bool
+    audio_channels: int | None = None
 
 
 def _parse_fraction(text: str) -> float | None:
@@ -35,10 +36,11 @@ def _parse_fraction(text: str) -> float | None:
 
 def probe(path: Path) -> ProbeResult:
     binary = find_binary("ffprobe")
-    cmd = [
-        binary,
-        "-v",
-        "error",
+    ext = path.suffix.lower().lstrip(".") if hasattr(path, "suffix") else ""
+    cmd = [binary, "-v", "error"]
+    if ext:
+        cmd += ["-f", ext]
+    cmd += [
         "-print_format",
         "json",
         "-show_format",
@@ -78,6 +80,7 @@ def probe(path: Path) -> ProbeResult:
     width = int(vstream["width"]) if vstream and vstream.get("width") else None
     height = int(vstream["height"]) if vstream and vstream.get("height") else None
     fps = _parse_fraction(str(vstream.get("r_frame_rate", ""))) if vstream else None
+    audio_channels = int(astream["channels"]) if astream and astream.get("channels") else None
 
     if vstream is not None:
         # single-frame videos are still images on disk (png); ffprobe reports
@@ -98,4 +101,5 @@ def probe(path: Path) -> ProbeResult:
         height=height,
         fps=fps,
         has_audio=astream is not None,
+        audio_channels=audio_channels,
     )
