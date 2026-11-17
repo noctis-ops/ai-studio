@@ -87,10 +87,15 @@ def _media_request(kind: str) -> MediaRequest:
     )
 
 
+# Single-call providers (LLM/TTS) get their own matrix in test_t_rec_02_single_call.py;
+# during_single_call can never fire on a job provider.
+JOB_CRASH_POINTS = tuple(p for p in CRASH_POINTS if p != "during_single_call")
+
+
 @pytest.mark.ffmpeg
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["image", "video"])
-@pytest.mark.parametrize("crash_point", CRASH_POINTS)
+@pytest.mark.parametrize("crash_point", JOB_CRASH_POINTS)
 async def test_crash_matrix(tmp_path, monkeypatch, kind, crash_point):
     home = make_home(tmp_path, registry_overrides=PAID_MOCK_PRICES, filename="rec")
     monkeypatch.setenv("STUDIO_HOME", str(home))
@@ -247,7 +252,8 @@ def _ctx():
     return CallContext(episode_id=None, stage_run_id=None, nonce="m1", purpose="crash-matrix")
 
 
-def test_crash_points_cover_the_seven_defined_points():
+def test_crash_points_cover_the_eight_defined_points():
+    # D2 (Phase 3) added during_single_call for single-call providers.
     assert set(CRASH_POINTS) == {
         "after_reserve",
         "before_submit",
@@ -256,4 +262,5 @@ def test_crash_points_cover_the_seven_defined_points():
         "during_poll",
         "after_fetch_before_store",
         "after_store_before_complete",
+        "during_single_call",
     }

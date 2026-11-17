@@ -55,6 +55,17 @@ class ZeroByteAssetError(PermanentProviderError):
     error_class = ErrorClass.PERMANENT
 
 
+class ProviderQuotaExceeded(PermanentProviderError):
+    """Provider-side quota exhausted (e.g. ElevenLabs `quota_exceeded`).
+
+    Treated like a budget halt by the engine: the run parks at halted_budget,
+    the stage_run goes back to pending, and an audit event with reason
+    `provider_quota` is written — never a retry loop.
+    """
+
+    error_class = ErrorClass.PERMANENT
+
+
 class BudgetExceeded(StudioError):
     def __init__(
         self,
@@ -92,3 +103,41 @@ class AssetNotFoundError(StudioError):
 
 class MediaToolError(StudioError):
     """ffmpeg/ffprobe exited non-zero or is missing."""
+
+
+class PreflightError(StudioError):
+    """S5a preflight failed before any spend (missing voice, over-budget worst case, ...)."""
+
+
+class TtsQualityError(PermanentProviderError):
+    """TTS QC rejected a line after `auto_retries` paid regenerations."""
+
+    error_class = ErrorClass.PERMANENT
+
+
+class TimelineOverflowError(StudioError):
+    """Narration does not fit inside its shot (exact numbers in the message)."""
+
+
+class TimingOverflowError(TimelineOverflowError):
+    """S6 reconciler found shots whose narration exceeds clip capacity.
+
+    Every overflowing shot is listed in the message with exact numbers; the
+    narration text is never modified.
+    """
+
+
+class LibraryEmptyError(StudioError):
+    """The plan needs a library item but the (active) library has none."""
+
+
+class MasteringError(MediaToolError):
+    """Loudness/true-peak verification after mastering failed."""
+
+
+class AudioQcError(StudioError):
+    """An audio QC check failed."""
+
+
+class AudioPlanError(StudioError):
+    """The audio plan (S7) could not be built deterministically."""

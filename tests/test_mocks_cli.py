@@ -188,3 +188,96 @@ def test_cli_end_to_end_demo(tmp_path, monkeypatch):
     assert "/" in rel_path and "\\" not in rel_path
     assert (home / "data" / "cas" / rel_path).is_file()
     conn.close()
+
+
+# --------------------------------------------------------------- T-CLI-03
+
+
+def _deliverable_id(home: Path) -> str:
+    conn = sqlite3.connect(str(home / "data" / "studio.db"))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT id FROM deliverables LIMIT 1").fetchone()
+    conn.close()
+    assert row is not None
+    return str(row["id"])
+
+
+def _series_slug(home: Path) -> str:
+    conn = sqlite3.connect(str(home / "data" / "studio.db"))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT slug FROM series LIMIT 1").fetchone()
+    conn.close()
+    assert row is not None
+    return str(row["slug"])
+
+
+@pytest.mark.ffmpeg
+def test_cli_03_library_scan_voice_set_run_preview_doctor(tmp_path, monkeypatch):
+    """T-CLI-03: library scan → voice set → sandbox run → audio preview →
+    doctor reports the new Phase 3 checks."""
+    home = make_home(tmp_path, filename="clit03")
+    monkeypatch.setenv("STUDIO_HOME", str(home))
+
+    result = runner.invoke(app, ["init"])
+    assert result.exit_code == 0, result.output
+
+    # scan on a home without a library yet: warns, exits 0
+    result = runner.invoke(app, ["library", "scan"])
+    assert result.exit_code == 0, result.output
+    assert "does not exist" in result.output
+
+    # seed the demo sandbox (fixtures land under <home>/library)
+    result = runner.invoke(app, ["run", "--demo", "--profile", "sandbox"])
+    assert result.exit_code == 0, result.output
+
+    # now the scan reconciles the seeded fixtures
+    result = runner.invoke(app, ["library", "scan"])
+    assert result.exit_code == 0, result.output
+    assert "active tracks:" in result.output
+
+    # voice set (re-attest explicitly)
+    slug = _series_slug(home)
+    result = runner.invoke(
+        app,
+        ["voice", "set", "narrator", "--series", slug, "--language", "ar",
+         "--voice-id", "mock-voice-ar", "--model-key", "mock.tts", "--attest-commercial"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "attestation:" in result.output
+
+    # drain the pipeline through the three gates
+    result = runner.invoke(app, ["worker", "--until-idle"])
+    assert result.exit_code == 0, result.output
+    for stage in ("G1_SCRIPT", "G2_KEYFRAMES", "G3_FINAL_CUT"):
+        gate_id = _pending_gate_id(home)
+        result = runner.invoke(app, ["gates", "approve", gate_id])
+        assert result.exit_code == 0, result.output
+        result = runner.invoke(app, ["worker", "--until-idle"])
+        assert result.exit_code == 0, result.output
+        if stage != "G3_FINAL_CUT":
+            assert _run_status(home) == "awaiting_approval"
+    assert _run_status(home) == "completed"
+
+    # audio preview: a playable stereo FLAC in data/previews/
+    deliverable_id = _deliverable_id(home)
+    result = runner.invoke(app, ["audio", "preview", deliverable_id])
+    assert result.exit_code == 0, result.output
+    previews = sorted((home / "data" / "previews").glob("*-master-*.flac"))
+    assert previews, "expected a master FLAC in data/previews"
+    info = probe(previews[-1])
+    assert (info.duration_ms or 0) > 0
+    assert info.audio_channels == 2
+
+    # doctor reports the new Phase 3 checks (no FAILs on the demo home)
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 0, result.output
+    for expected in (
+        "ffmpeg filtergraph file option",
+        "sample rate % fps",
+        "ELEVENLABS_API_KEY",
+        "tts.keep_diacritics",
+        "audio library",
+        "voice attestations",
+        "TTS registry tts.main",
+    ):
+        assert expected in result.output

@@ -65,6 +65,8 @@ class ProvidersRepo(Protocol):
         self, call_id: str, remote_request_id: str, *, conn: sqlite3.Connection | None = None
     ) -> None: ...
 
+    def set_remote_request_id(self, call_id: str, remote_request_id: str) -> None: ...
+
     def bump_attempt(self, call_id: str) -> None: ...
 
     def set_terminal(
@@ -216,6 +218,14 @@ class SqliteProvidersRepo(SqliteRepo):
         self.db.connect().execute(
             "UPDATE provider_calls SET attempt = attempt + 1, updated_at = ? WHERE id = ?",
             (now, call_id),
+        )
+
+    def set_remote_request_id(self, call_id: str, remote_request_id: str) -> None:
+        now = self._now()
+        self.db.connect().execute(
+            "UPDATE provider_calls SET remote_request_id = ?, updated_at = ? "
+            "WHERE id = ? AND remote_request_id IS NULL",
+            (remote_request_id, now, call_id),
         )
 
     def set_terminal(

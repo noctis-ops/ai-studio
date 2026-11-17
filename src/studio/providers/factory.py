@@ -2,9 +2,8 @@
 
 `provider == "mock"` returns a mock configured from settings (unchanged
 Phase 1 behavior). `anthropic` / `openai` bind lazily to the Phase 2 LLM
-adapters: the adapter module imports cleanly without the SDK, and a missing
-SDK surfaces as ConfigError("LLM adapter '<name>' requires ai-studio[providers]")
-at client construction time — never at import time, never with a secret.
+adapters (a missing SDK surfaces as ConfigError at client construction time).
+`elevenlabs` binds to the Phase 3 ElevenLabs TTS adapter (raw httpx, no SDK).
 Anything else is a ConfigError naming the provider and the phase that will
 implement it.
 """
@@ -32,8 +31,11 @@ _REAL_LLM_ADAPTERS: dict[str, tuple[str, str]] = {
     "openai": ("studio.providers.openai_llm", "OpenAILLMProvider"),
 }
 
+_REAL_TTS_ADAPTERS: dict[str, tuple[str, str]] = {
+    "elevenlabs": ("studio.providers.tts.elevenlabs", "ElevenLabsTTSProvider"),
+}
+
 _FUTURE_PROVIDERS: dict[str, str] = {
-    "elevenlabs": "Phase 4 (TTS)",
     "fal": "Phase 4 (image/video)",
 }
 
@@ -58,13 +60,27 @@ def build_provider(
         module = importlib.import_module(module_name)
         adapter_cls = getattr(module, class_name)
         return adapter_cls(entry)
+    tts_binding = _REAL_TTS_ADAPTERS.get(entry.provider)
+    if tts_binding is not None:
+        if entry.capability != "tts":
+            raise ConfigError(
+                f"provider {entry.provider!r} adapter only supports capability "
+                f"'tts', got {entry.capability!r}"
+            )
+        module_name, class_name = tts_binding
+        module = importlib.import_module(module_name)
+        adapter_cls = getattr(module, class_name)
+        timeout_s = float(getattr(settings.tts, "request_timeout_s", 120.0))
+        return adapter_cls(entry, timeout_s=timeout_s)
     future = _FUTURE_PROVIDERS.get(entry.provider)
     if future is not None:
         raise ConfigError(
             f"provider {entry.provider!r} is not implemented in this phase ({future}); "
             f"no adapter is registered for capability {entry.capability!r}"
         )
-    known = ", ".join(sorted(["mock", *_REAL_LLM_ADAPTERS, *_FUTURE_PROVIDERS]))
+    known = ", ".join(
+        sorted(["mock", *_REAL_LLM_ADAPTERS, *_REAL_TTS_ADAPTERS, *_FUTURE_PROVIDERS])
+    )
     raise ConfigError(f"unknown provider {entry.provider!r} (known: {known})")
 
 

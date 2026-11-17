@@ -426,6 +426,8 @@ async def test_request_changes_reexecutes_only_the_rejected_shot(
         ).fetchall()
         if r["id"] not in before_ids
     ]
+
+
     assert {c["capability"] for c in new_calls} == {"image_reference_generate"}
     assert edited in new_calls[0]["request_json"]
 
@@ -916,7 +918,13 @@ async def test_invalidation_cascades_downstream_and_reruns_for_free(
             invalidated_ids,
         ).fetchall()
     }
-    assert stages == {"demo_script", "demo_voice", "demo_keyframes", "demo_clips", "demo_finalize"}
+    # Phase 3: the audio chain (s5a/s5/s6/s7/s7b) joins the staleness graph —
+    # a G2 script edit invalidates it too. demo_voice remains (line materializer).
+    assert stages == {
+        "demo_script", "demo_voice", "s5a_tts_preflight", "s5_tts", "s6_timing",
+        "s7_audio_plan", "s7b_audio_mix",
+        "demo_keyframes", "demo_clips", "demo_finalize",
+    }
     # the pending rows are re-enqueued incrementally: script goes first, the
     # rest follow as dependency stages complete (job completion enqueues advance)
     queued = db.connect().execute(

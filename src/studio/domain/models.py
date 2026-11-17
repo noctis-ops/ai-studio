@@ -63,6 +63,11 @@ class ShotRow(_Row):
     shot_no: int
     prompt: str
     created_at: str
+    clip_duration_ms: int | None = None
+    speed_factor: float = 1.0
+    hold_frames: int = 0
+    min_duration_ms: int | None = None
+    timing_status: str = "pending"
 
 
 class ShotAttemptRow(_Row):
@@ -84,6 +89,17 @@ class NarrationLineRow(_Row):
     asset_sha256: str | None
     duration_ms: int | None
     created_at: str
+    text_final: str | None = None
+    conformed_sha256: str | None = None
+    conformed_samples: int | None = None
+    status: str = "pending"
+    tts_nonce: str = "0"
+    voice_snapshot_json: str = "{}"
+
+    @property
+    def approved_text(self) -> str:
+        """The text Gate 1 approved, overlaid by any operator post-gate edit."""
+        return self.text_final if self.text_final is not None else self.text
 
 
 class AssetRow(_Row):
@@ -98,6 +114,98 @@ class AssetRow(_Row):
     retention: str
     created_at: str
     purged_at: str | None
+    purge_after: str | None = None
+
+
+class SceneRow(_Row):
+    id: str
+    track_id: str
+    scene_no: int
+    shot_from: int
+    shot_to: int
+    music_mood: str | None
+    intensity: int = 3
+    ambience_tags_json: str = "[]"
+    created_at: str
+
+
+class CharacterVoiceRow(_Row):
+    id: str
+    series_id: str
+    character_slug: str
+    language: str
+    voice_id: str
+    settings_json: str
+    created_at: str
+    updated_at: str
+
+
+class AudioLibraryRow(_Row):
+    sha256: str
+    rel_path: str
+    kind: str
+    title: str
+    moods_json: str = "[]"
+    intensity: int | None = None
+    bpm: int | None = None
+    loopable: int = 0
+    duration_ms: int = 0
+    loudness_lufs: float | None = None
+    license: str | None = None
+    license_url: str | None = None
+    source: str | None = None
+    attribution_required: int = 0
+    attribution_text: str | None = None
+    active: int = 0
+    scan_error: str | None = None
+    created_at: str
+    updated_at: str
+
+
+class AudioCueRow(_Row):
+    id: str
+    deliverable_id: str
+    cue_index: int
+    kind: str
+    library_sha256: str
+    scene_id: str | None
+    start_frame: int
+    end_frame: int
+    source_offset_ms: int
+    gain_db: float
+    fade_in_ms: int
+    fade_out_ms: int
+    params_json: str = "{}"
+    plan_hash: str | None = None
+    created_at: str
+
+
+class QcResultRow(_Row):
+    id: str
+    deliverable_id: str | None = None
+    subject_scope: str = "deliverable"
+    subject_id: str
+    check_name: str
+    status: str
+    detail_json: str = "{}"
+    created_at: str
+
+
+class AudioMasterRow(_Row):
+    id: str
+    deliverable_id: str
+    input_hash: str
+    timeline_hash: str
+    master_sha256: str
+    narration_stem_sha256: str | None
+    total_samples: int
+    loudness_i: float | None = None
+    true_peak: float | None = None
+    lra: float | None = None
+    duck_depth_db: float | None = None
+    stats_json: str = "{}"
+    status: str = "ready"
+    created_at: str
 
 
 class CacheEntryRow(_Row):

@@ -22,6 +22,10 @@ class Vocab(BaseModel):
     shot_types: list[str]
     camera_moves: list[str]
     intensity: list[int]
+    sfx_tags: list[str]
+    ambience_tags: list[str]
+    # Optional {mood: {neighbor_mood: affinity}} with affinity in [0, 1].
+    mood_affinity: dict[str, dict[str, float]] = {}
 
 
 def _check_list(name: str, values: list[str], source: str) -> None:
@@ -58,6 +62,22 @@ def load_vocab_file(path: Path) -> Vocab:
     _check_list("moods", vocab.moods, source)
     _check_list("shot_types", vocab.shot_types, source)
     _check_list("camera_moves", vocab.camera_moves, source)
+    _check_list("sfx_tags", vocab.sfx_tags, source)
+    _check_list("ambience_tags", vocab.ambience_tags, source)
+    mood_set = set(vocab.moods)
+    for mood, neighbors in vocab.mood_affinity.items():
+        if mood not in mood_set:
+            raise ConfigError(f"{source}: mood_affinity key {mood!r} is not a known mood")
+        for neighbor, value in neighbors.items():
+            if neighbor not in mood_set:
+                raise ConfigError(
+                    f"{source}: mood_affinity[{mood!r}] has unknown mood {neighbor!r}"
+                )
+            if not 0.0 <= value <= 1.0:
+                raise ConfigError(
+                    f"{source}: mood_affinity[{mood!r}][{neighbor!r}] must be in [0, 1], "
+                    f"got {value}"
+                )
     if vocab.intensity != INTENSITY_DOMAIN:
         raise ConfigError(f"{source}: intensity must be exactly [1, 2, 3, 4, 5]")
     return vocab

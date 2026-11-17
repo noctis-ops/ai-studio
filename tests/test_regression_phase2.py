@@ -6,6 +6,7 @@ reported in PHASE2_REPORT.md, not re-implemented here.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -21,7 +22,9 @@ def test_draft_still_refuses_without_verifying_media_models(tmp_path, monkeypatc
     home = make_home(tmp_path, filename="regr02")
     monkeypatch.setenv("STUDIO_HOME", str(home))
     config = load_all(home)  # shipped configs, zero overrides
-    with pytest.raises(RegistryError, match="placeholder"):
+    # Phase 3 Part 2 merged a non-placeholder tts.main, so the draft refusal is
+    # now the zero-priced, unverified image/video entries — still fail-closed.
+    with pytest.raises(RegistryError, match=re.escape("image.keyframe")):
         config.registry.resolve_profile("draft")
 
 

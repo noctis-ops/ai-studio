@@ -49,6 +49,7 @@ class ContentStore:
         ext: str,
         retention: str = "intermediate",
         move: bool = True,
+        purge_after: str | None = None,
     ) -> AssetRef:
         src = Path(src)
         if not src.is_file():
@@ -75,6 +76,7 @@ class ContentStore:
             ext=ext,
             size=size,
             retention=retention,
+            purge_after=purge_after,
             duration_ms=probed.duration_ms if probed else None,
             width=probed.width if probed else None,
             height=probed.height if probed else None,
@@ -87,6 +89,7 @@ class ContentStore:
         kind: str,
         ext: str,
         retention: str = "intermediate",
+        purge_after: str | None = None,
     ) -> AssetRef:
         if len(data) == 0:
             raise ZeroByteAssetError("refusing to store zero-byte payload")
@@ -104,6 +107,7 @@ class ContentStore:
             ext=ext,
             size=len(data),
             retention=retention,
+            purge_after=purge_after,
             duration_ms=None,
             width=None,
             height=None,
@@ -162,6 +166,7 @@ class ContentStore:
         duration_ms: int | None,
         width: int | None,
         height: int | None,
+        purge_after: str | None = None,
     ) -> AssetRef:
         row = self.assets.upsert(
             sha256=sha256,
@@ -173,6 +178,7 @@ class ContentStore:
             width=width,
             height=height,
             retention=retention,
+            purge_after=purge_after,
         )
         return _to_ref(row)
 

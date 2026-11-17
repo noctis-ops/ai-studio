@@ -9,6 +9,7 @@ from studio.core.ids import Ids
 
 from ..connection import Database
 from .assets import AssetsRepo, SqliteAssetsRepo
+from .audio import AudioRepo, NewAudioCue, SqliteAudioRepo
 from .audit import AuditRepo, SqliteAuditRepo
 from .bible import BibleRepo, SqliteBibleRepo
 from .budgets import BudgetsRepo, SqliteBudgetsRepo
@@ -20,17 +21,20 @@ from .providers import NewCacheEntry, NewCall, ProvidersRepo, SqliteProvidersRep
 
 __all__ = [
     "AssetsRepo",
+    "AudioRepo",
     "AuditRepo",
     "BibleRepo",
     "BudgetsRepo",
     "ContentRepo",
     "GatesRepo",
     "JobsRepo",
+    "NewAudioCue",
     "NewCacheEntry",
     "NewCall",
     "PipelineRepo",
     "ProvidersRepo",
     "SqliteAssetsRepo",
+    "SqliteAudioRepo",
     "SqliteAuditRepo",
     "SqliteBibleRepo",
     "SqliteBudgetsRepo",
@@ -48,6 +52,7 @@ __all__ = [
 @dataclass
 class StudioRepos:
     assets: AssetsRepo
+    audio: AudioRepo
     bible: BibleRepo
     providers: ProvidersRepo
     budgets: BudgetsRepo
@@ -61,6 +66,7 @@ class StudioRepos:
 def build_repos(db: Database, clock: Clock, ids: Ids | None = None) -> StudioRepos:
     return StudioRepos(
         assets=SqliteAssetsRepo(db, clock, ids),
+        audio=SqliteAudioRepo(db, clock, ids),
         bible=SqliteBibleRepo(db, clock, ids),
         providers=SqliteProvidersRepo(db, clock, ids),
         budgets=SqliteBudgetsRepo(db, clock, ids),

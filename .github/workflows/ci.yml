@@ -24,19 +24,15 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      - name: Install ffmpeg (Ubuntu)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
-
-      - name: Check ffmpeg (Windows)
-        if: runner.os == 'Windows'
-        # windows-latest ships ffmpeg preinstalled; choco would be redundant and slow.
-        run: |
-          ffmpeg -version
-          ffprobe -version
+      - name: Set up FFmpeg
+        # FedericoCarboni/setup-ffmpeg@v3 (pinned to the v3 tag commit)
+        uses: FedericoCarboni/setup-ffmpeg@36c6454b5a2348e7794ba2d82a21506605921e3d
 
       - name: Install package
         run: python -m pip install --upgrade pip && python -m pip install -e .[dev,providers]
+
+      - name: Check ffmpeg capabilities (D3)
+        run: python scripts/check_ffmpeg.py
 
       - name: Ruff
         run: ruff check src tests
@@ -46,6 +42,7 @@ jobs:
 
       - name: Tests (with coverage gate)
         run: >-
-          python -m pytest tests/ -q
+          python -m pytest tests/ -q -m "not slow"
           --cov=studio.core --cov=studio.db --cov=studio.pipeline
+          --cov=studio.audio --cov=studio.providers.tts
           --cov-report=term-missing --cov-fail-under=90

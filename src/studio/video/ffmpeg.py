@@ -52,3 +52,114 @@ async def _run(binary: str, args: list[str], *, timeout_s: float, tool: str) -> 
         detail = stderr.decode("utf-8", errors="replace").strip()
         raise MediaToolError(f"{tool} exited with {proc.returncode}: {detail[-500:]}")
     return stdout, stderr
+
+
+# =====================================================================
+# Phase 3 extensions (H5/H9/H10, D3)
+# =====================================================================
+
+# D3: exact filter set the audio chain relies on (mastering, ducking,
+# conform, QC). `asplit`/`volumedetect` are required by the ducking/envelope
+# design; the rest mirrors PHASE3 §D3.
+REQUIRED_FILTERS = (
+    "loudnorm", "ebur128", "astats", "sidechaincompress", "volume", "amix",
+    "adelay", "afade", "atrim", "apad", "aresample", "aformat",
+    "silenceremove", "areverse", "alimiter", "anullsrc", "asetnsamples",
+    "ametadata", "pan", "asplit",
+)
+
+_version_cache: tuple[int, int, int] | None = None
+
+
+def parse_version(text: str) -> tuple[int, int, int]:
+    """Parse `ffmpeg version N.M...` output; raises MediaToolError if absent."""
+    import re
+
+    match = re.search(r"version\s+[^\d\n]*(\d+)\.(\d+)(?:\.(\d+))?", text)
+    if match is None:
+        raise MediaToolError(f"could not parse ffmpeg version from: {text[:200]!r}")
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3) or 0))
+
+
+async def ffmpeg_version() -> tuple[int, int, int]:
+    """Detect (and cache) the ffmpeg major/minor/patch version."""
+    global _version_cache
+    if _version_cache is not None:
+        return _version_cache
+    stdout, _ = await run_ffmpeg(["-version"], timeout_s=30.0)
+    _version_cache = parse_version(stdout.decode("utf-8", errors="replace"))
+    return _version_cache
+
+
+def filtergraph_script_args(path: str, version: tuple[int, int, int]) -> list[str]:
+    """Version-appropriate arguments to load a filtergraph from a UTF-8 file.
+
+    FFmpeg >= 7.0 supports `-/filter_complex <file>`; older versions need
+    `-filter_complex_script <file>`.
+    """
+    if version >= (7, 0, 0):
+        return ["-/filter_complex", str(path)]
+    return ["-filter_complex_script", str(path)]
+
+
+async def available_filters() -> set[str]:
+    """Names of compiled-in filters (from `ffmpeg -filters`)."""
+    stdout, _ = await run_ffmpeg(["-hide_banner", "-filters"], timeout_s=30.0)
+    filters: set[str] = set()
+    import re
+
+    for line in stdout.decode("utf-8", errors="replace").splitlines():
+        match = re.match(r"^\s*[A-Za-z0-9.|]{1,4}\s+([a-z0-9_]{2,})\s", line)
+        if match:
+            filters.add(match.group(1))
+    return filters
+
+
+async def capability_check() -> tuple[tuple[int, int, int], list[str]]:
+    """D3: return (version, missing_required_filters)."""
+    version = await ffmpeg_version()
+    have = await available_filters()
+    missing = [name for name in dict.fromkeys(REQUIRED_FILTERS) if name not in have]
+    return version, missing
+
+
+async def probe_duration_seconds(path: str, *, timeout_s: float = 30.0) -> float:
+    """Container duration in seconds via ffprobe (float; informational only)."""
+    import json
+
+    stdout, _ = await run_ffprobe(
+        [
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "json",
+            str(path),
+        ],
+        timeout_s=timeout_s,
+    )
+    try:
+        data = json.loads(stdout.decode("utf-8", errors="replace"))
+        return float(data["format"]["duration"])
+    except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
+        raise MediaToolError(f"ffprobe could not read duration of {path}: {exc}") from exc
+
+
+async def probe_sample_rate_channels(path: str, *, timeout_s: float = 30.0) -> tuple[int, int]:
+    """(sample_rate, channels) of the first audio stream via ffprobe."""
+    import json
+
+    stdout, _ = await run_ffprobe(
+        [
+            "-v", "error",
+            "-select_streams", "a:0",
+            "-show_entries", "stream=sample_rate,channels",
+            "-of", "json",
+            str(path),
+        ],
+        timeout_s=timeout_s,
+    )
+    try:
+        data = json.loads(stdout.decode("utf-8", errors="replace"))
+        stream = data["streams"][0]
+        return int(stream["sample_rate"]), int(stream["channels"])
+    except (json.JSONDecodeError, KeyError, IndexError, ValueError, TypeError) as exc:
+        raise MediaToolError(f"ffprobe could not read stream info of {path}: {exc}") from exc

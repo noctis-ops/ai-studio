@@ -10,6 +10,7 @@ from studio.domain.models import (
     DeliverableRow,
     EpisodeRow,
     NarrationLineRow,
+    SceneRow,
     SeriesRow,
     ShotAttemptRow,
     ShotRow,
@@ -23,6 +24,8 @@ class ContentRepo(Protocol):
     def create_series(self, *, name: str, slug: str) -> SeriesRow: ...
     def get_series(self, series_id: str) -> SeriesRow | None: ...
 
+    def get_series_by_slug(self, slug: str) -> SeriesRow | None: ...
+
     def create_character(
         self, *, series_id: str, role: str, name: str, voices_json: str
     ) -> CharacterRow: ...
@@ -30,6 +33,8 @@ class ContentRepo(Protocol):
     def get_character(self, character_id: str) -> CharacterRow | None: ...
 
     def get_narrator(self, series_id: str) -> CharacterRow | None: ...
+
+    def get_character_by_slug(self, series_id: str, slug: str) -> CharacterRow | None: ...
 
     def create_episode(
         self, *, series_id: str, title: str, concept: str, languages_json: str, aspects_json: str
@@ -60,7 +65,14 @@ class ContentRepo(Protocol):
 
     def get_deliverable(self, deliverable_id: str) -> DeliverableRow | None: ...
 
-    def create_shot(self, *, track_id: str, shot_no: int, prompt: str) -> ShotRow: ...
+    def create_shot(
+        self,
+        *,
+        track_id: str,
+        shot_no: int,
+        prompt: str,
+        min_duration_ms: int | None = None,
+    ) -> ShotRow: ...
 
     def list_shots(self, episode_id: str) -> list[ShotRow]: ...
 
@@ -91,6 +103,49 @@ class ContentRepo(Protocol):
         duration_ms: int | None,
     ) -> NarrationLineRow: ...
 
+    def get_narration_line(self, line_id: str) -> NarrationLineRow | None: ...
+
+    def narration_lines_for_episode(self, episode_id: str) -> list[NarrationLineRow]: ...
+
+    def set_line_tts_nonce(self, line_id: str, tts_nonce: str) -> None: ...
+
+    def set_line_text_final(self, line_id: str, text_final: str | None) -> None: ...
+
+    def mark_line_voiced(
+        self,
+        line_id: str,
+        *,
+        asset_sha256: str,
+        duration_ms: int | None,
+        conformed_sha256: str,
+        conformed_samples: int,
+        voice_snapshot_json: str,
+    ) -> None: ...
+
+    def set_shot_timing(
+        self,
+        shot_id: str,
+        *,
+        clip_duration_ms: int,
+        speed_factor: float,
+        hold_frames: int,
+        timing_status: str,
+    ) -> None: ...
+
+    def upsert_scene(
+        self,
+        *,
+        track_id: str,
+        scene_no: int,
+        shot_from: int,
+        shot_to: int,
+        music_mood: str | None,
+        intensity: int,
+        ambience_tags_json: str,
+    ) -> SceneRow: ...
+
+    def list_scenes(self, track_id: str) -> list[SceneRow]: ...
+
     def narration_lines(self, deliverable_id: str) -> list[NarrationLineRow]: ...
 
     def narration_lines_for_shot(self, shot_id: str) -> list[NarrationLineRow]: ...
@@ -105,6 +160,14 @@ class SqliteContentRepo(SqliteRepo):
         row = (
             self.db.connect()
             .execute("SELECT * FROM series WHERE id = ?", (series_id,))
+            .fetchone()
+        )
+        return SeriesRow.model_validate(row_to_dict(row)) if row else None
+
+    def get_series_by_slug(self, slug: str) -> SeriesRow | None:
+        row = (
+            self.db.connect()
+            .execute("SELECT * FROM series WHERE slug = ?", (slug,))
             .fetchone()
         )
         return SeriesRow.model_validate(row_to_dict(row)) if row else None
@@ -140,6 +203,17 @@ class SqliteContentRepo(SqliteRepo):
         row = (
             self.db.connect()
             .execute("SELECT * FROM characters WHERE id = ?", (character_id,))
+            .fetchone()
+        )
+        return CharacterRow.model_validate(row_to_dict(row)) if row else None
+
+    def get_character_by_slug(self, series_id: str, slug: str) -> CharacterRow | None:
+        row = (
+            self.db.connect()
+            .execute(
+                "SELECT * FROM characters WHERE series_id = ? AND role = ?",
+                (series_id, slug),
+            )
             .fetchone()
         )
         return CharacterRow.model_validate(row_to_dict(row)) if row else None
@@ -293,16 +367,24 @@ class SqliteContentRepo(SqliteRepo):
 
     # ---- shots / attempts ---------------------------------------------------
 
-    def create_shot(self, *, track_id: str, shot_no: int, prompt: str) -> ShotRow:
+    def create_shot(
+        self,
+        *,
+        track_id: str,
+        shot_no: int,
+        prompt: str,
+        min_duration_ms: int | None = None,
+    ) -> ShotRow:
         now = self._now()
         shot_id = self._new_id()
         conn = self.db.connect()
         conn.execute(
             """
-            INSERT OR IGNORE INTO shots(id, track_id, shot_no, prompt, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT OR IGNORE INTO shots(id, track_id, shot_no, prompt, created_at,
+                                        min_duration_ms)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (shot_id, track_id, shot_no, prompt, now),
+            (shot_id, track_id, shot_no, prompt, now, min_duration_ms),
         )
         row = conn.execute(
             "SELECT * FROM shots WHERE track_id = ? AND shot_no = ?", (track_id, shot_no)
@@ -446,3 +528,137 @@ class SqliteContentRepo(SqliteRepo):
         )
         value = row["max_ms"] if row else None
         return int(value) if value is not None else None
+
+    # ---- Phase 3: narration lines (S5 / S6) --------------------------------
+
+    def get_narration_line(self, line_id: str) -> NarrationLineRow | None:
+        row = (
+            self.db.connect()
+            .execute("SELECT * FROM narration_lines WHERE id = ?", (line_id,))
+            .fetchone()
+        )
+        return NarrationLineRow.model_validate(row_to_dict(row)) if row else None
+
+    def narration_lines_for_episode(self, episode_id: str) -> list[NarrationLineRow]:
+        rows = (
+            self.db.connect()
+            .execute(
+                """
+            SELECT n.* FROM narration_lines n
+            JOIN deliverables d ON d.id = n.deliverable_id
+            JOIN tracks t ON t.id = d.track_id
+            WHERE t.episode_id = ?
+            ORDER BY t.created_at, t.id, d.id, n.line_no
+            """,
+                (episode_id,),
+            )
+            .fetchall()
+        )
+        return [NarrationLineRow.model_validate(row_to_dict(r)) for r in rows]
+
+    def set_line_tts_nonce(self, line_id: str, tts_nonce: str) -> None:
+        self.db.connect().execute(
+            "UPDATE narration_lines SET tts_nonce = ? WHERE id = ?",
+            (tts_nonce, line_id),
+        )
+
+    def set_line_text_final(self, line_id: str, text_final: str | None) -> None:
+        self.db.connect().execute(
+            "UPDATE narration_lines SET text_final = ? WHERE id = ?",
+            (text_final, line_id),
+        )
+
+    def mark_line_voiced(
+        self,
+        line_id: str,
+        *,
+        asset_sha256: str,
+        duration_ms: int | None,
+        conformed_sha256: str,
+        conformed_samples: int,
+        voice_snapshot_json: str,
+    ) -> None:
+        self.db.connect().execute(
+            """
+            UPDATE narration_lines SET
+                asset_sha256 = ?,
+                duration_ms = ?,
+                conformed_sha256 = ?,
+                conformed_samples = ?,
+                voice_snapshot_json = ?,
+                status = 'voiced'
+            WHERE id = ?
+            """,
+            (asset_sha256, duration_ms, conformed_sha256, conformed_samples,
+             voice_snapshot_json, line_id),
+        )
+
+    def set_shot_timing(
+        self,
+        shot_id: str,
+        *,
+        clip_duration_ms: int,
+        speed_factor: float,
+        hold_frames: int,
+        timing_status: str,
+    ) -> None:
+        self.db.connect().execute(
+            """
+            UPDATE shots SET
+                clip_duration_ms = ?,
+                speed_factor = ?,
+                hold_frames = ?,
+                timing_status = ?
+            WHERE id = ?
+            """,
+            (clip_duration_ms, speed_factor, hold_frames, timing_status, shot_id),
+        )
+
+    # ---- Phase 3: scenes ---------------------------------------------------
+
+    def upsert_scene(
+        self,
+        *,
+        track_id: str,
+        scene_no: int,
+        shot_from: int,
+        shot_to: int,
+        music_mood: str | None,
+        intensity: int,
+        ambience_tags_json: str,
+    ) -> SceneRow:
+        now = self._now()
+        scene_id = self._new_id()
+        conn = self.db.connect()
+        conn.execute(
+            """
+            INSERT INTO scenes(id, track_id, scene_no, shot_from, shot_to,
+                               music_mood, intensity, ambience_tags_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(track_id, scene_no) DO UPDATE SET
+                shot_from = excluded.shot_from,
+                shot_to = excluded.shot_to,
+                music_mood = excluded.music_mood,
+                intensity = excluded.intensity,
+                ambience_tags_json = excluded.ambience_tags_json
+            """,
+            (scene_id, track_id, scene_no, shot_from, shot_to,
+             music_mood, intensity, ambience_tags_json, now),
+        )
+        row = conn.execute(
+            "SELECT * FROM scenes WHERE track_id = ? AND scene_no = ?",
+            (track_id, scene_no),
+        ).fetchone()
+        assert row is not None
+        return SceneRow.model_validate(row_to_dict(row))
+
+    def list_scenes(self, track_id: str) -> list[SceneRow]:
+        rows = (
+            self.db.connect()
+            .execute(
+                "SELECT * FROM scenes WHERE track_id = ? ORDER BY scene_no",
+                (track_id,),
+            )
+            .fetchall()
+        )
+        return [SceneRow.model_validate(row_to_dict(r)) for r in rows]

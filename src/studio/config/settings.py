@@ -12,7 +12,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from studio.domain.enums import Aspect, Language, Profile
 from studio.domain.errors import ConfigError
@@ -87,6 +87,124 @@ class RetentionSettings(_Strict):
     keep_narration_audio_days: int = Field(default=30, ge=0)
 
 
+class DoctorSettings(_Strict):
+    probe_timeout_s: float = Field(default=30, gt=0)
+
+
+class RenderSettings(_Strict):
+    fps: int = Field(default=24, ge=1)
+
+
+class TtsQcSettings(_Strict):
+    min_duration_ratio: float = Field(default=0.4, gt=0)
+    max_duration_ratio: float = Field(default=2.5, gt=0)
+    auto_retries: int = Field(default=1, ge=0)
+
+
+class TtsSettings(_Strict):
+    request_timeout_s: float = Field(default=120, gt=0)
+    use_context: bool = True
+    context_max_chars: int = Field(default=300, ge=0)
+    keep_diacritics: bool = True
+    qc: TtsQcSettings = TtsQcSettings()
+
+
+class TimingSettings(_Strict):
+    max_stretch: float = Field(default=1.15, ge=1.0)
+    max_hold_ms: int = Field(default=500, ge=0)
+    j_cut_ms: int = Field(default=0)
+    prefer_stretch_to_save_cost: bool = True
+    estimate_drift_warn_pct: float = Field(default=25, ge=0)
+    # The prompt references lead_in_ms, line_gap_ms and tail_ms from `timing`
+    # without giving values; defaults chosen by the implementer (recorded).
+    lead_in_ms: int = Field(default=150, ge=0)
+    line_gap_ms: int = Field(default=120, ge=0)
+    tail_ms: int = Field(default=200, ge=0)
+    # S6 QC needs words-per-second per language; calibrate with `studio audio
+    # calibrate` and adjust (recorded assumption).
+    words_per_second: dict[str, float] = {"ar": 2.5, "en": 2.5}
+
+
+class AudioLevelsSettings(_Strict):
+    speech_line_lufs: float = -20.0
+    max_line_gain_db: float = Field(default=9.0, gt=0)
+    music_lufs: float = -24.0
+    ambience_lufs: float = -34.0
+    sfx_lufs: float = -22.0
+    intensity_offset_db: dict[int, float] = {1: -8.0, 2: -5.0, 3: -3.0, 4: -1.0, 5: 0.0}
+    intensity_ramp_ms: int = Field(default=800, ge=0)
+
+
+class SpeechTrimSettings(_Strict):
+    threshold_db: float = -50.0
+    keep_ms: int = Field(default=60, ge=0)
+
+
+class MusicSettings(_Strict):
+    fade_in_ms: int = Field(default=1000, ge=0)
+    final_fade_ms: int = Field(default=2000, ge=0)
+    crossfade_ms: int = Field(default=1500, ge=0)
+    recent_penalty_episodes: int = Field(default=3, ge=0)
+    recent_penalty: float = Field(default=1.0, ge=0)
+    loop_penalty: float = Field(default=0.5, ge=0)
+    segment_intensity_break: int = Field(default=2, ge=1)
+
+
+class SidechainSettings(_Strict):
+    threshold: float = Field(default=0.05, gt=0)
+    ratio: float = Field(default=8.0, gt=0)
+    attack_ms: float = Field(default=20.0, gt=0)
+    release_ms: float = Field(default=350.0, gt=0)
+    makeup: float = Field(default=1.0, gt=0)
+
+
+class DuckSettings(_Strict):
+    mode: str = "envelope"
+    depth_db: float = Field(default=10.0, gt=0)
+    pre_ms: float = Field(default=150.0, ge=0)
+    attack_ms: float = Field(default=120.0, ge=0)
+    release_ms: float = Field(default=450.0, ge=0)
+    merge_gap_ms: float = Field(default=700.0, ge=0)
+    ambience_fraction: float = Field(default=0.5, ge=0, le=1)
+    sidechain: SidechainSettings = SidechainSettings()
+
+
+class SfxSettings(_Strict):
+    transition_enabled: bool = True
+    transition_tag: str = "transition"
+    transition_offset_ms: int = -150
+
+
+class MasterSettings(_Strict):
+    target_lufs: float = -14.0
+    true_peak_db: float = -1.5
+    lra: float = Field(default=11.0, gt=0)
+    lufs_tolerance: float = Field(default=1.0, gt=0)
+    tp_ceiling_db: float = -1.0
+    clip_peak_db: float = -0.1
+
+
+class AudioQcSettings(_Strict):
+    min_duck_db: float = Field(default=8.0, gt=0)
+    min_speech_to_music_db: float = Field(default=10.0, gt=0)
+    silent_line_rms_db: float = -45.0
+    window_ms: int = Field(default=100, gt=0)
+    exclude_onset_ms: int = Field(default=150, ge=0)
+
+
+class AudioSettings(_Strict):
+    sample_rate: int = Field(default=48000, ge=8000)
+    library_root: str = "library"
+    scan_extensions: list[str] = [".wav", ".mp3", ".flac", ".ogg"]
+    levels: AudioLevelsSettings = AudioLevelsSettings()
+    speech_trim: SpeechTrimSettings = SpeechTrimSettings()
+    music: MusicSettings = MusicSettings()
+    sfx: SfxSettings = SfxSettings()
+    duck: DuckSettings = DuckSettings()
+    master: MasterSettings = MasterSettings()
+    qc: AudioQcSettings = AudioQcSettings()
+
+
 class TextPipelineSettings(_Strict):
     context_token_budget: int = Field(default=6000, ge=500, le=100000)
     tashkeel_retry: int = Field(default=1, ge=0, le=2)
@@ -117,6 +235,51 @@ class Settings(_Strict):
     mock: MockSettings = MockSettings()
     retention: RetentionSettings = RetentionSettings()
     text_pipeline: TextPipelineSettings = TextPipelineSettings()
+    doctor: DoctorSettings = DoctorSettings()
+    render: RenderSettings = RenderSettings()
+    tts: TtsSettings = TtsSettings()
+    timing: TimingSettings = TimingSettings()
+    audio: AudioSettings = AudioSettings()
+
+    @model_validator(mode="after")
+    def _check_cross_field(self) -> Settings:
+        fps = self.render.fps
+        sample_rate = self.audio.sample_rate
+        if sample_rate % fps != 0:
+            raise ConfigError(
+                f"render.fps ({fps}) must divide audio.sample_rate ({sample_rate}) exactly"
+            )
+        if self.timing.j_cut_ms != 0:
+            raise ConfigError("timing.j_cut_ms is not supported before Phase 5; set it to 0")
+        if self.audio.duck.attack_ms > self.audio.duck.pre_ms:
+            raise ConfigError(
+                f"audio.duck.attack_ms ({self.audio.duck.attack_ms}) must be <= "
+                f"audio.duck.pre_ms ({self.audio.duck.pre_ms})"
+            )
+        if self.audio.duck.mode not in ("envelope", "sidechain"):
+            raise ConfigError(
+                f"audio.duck.mode must be 'envelope' or 'sidechain', got {self.audio.duck.mode!r}"
+            )
+        if self.tts.qc.max_duration_ratio < self.tts.qc.min_duration_ratio:
+            raise ConfigError(
+                "tts.qc.max_duration_ratio must be >= tts.qc.min_duration_ratio"
+            )
+        allowed = {member.value for member in Language}
+        for key in self.timing.words_per_second:
+            if key not in allowed:
+                raise ConfigError(
+                    f"timing.words_per_second has unsupported language {key!r} "
+                    f"(allowed: {sorted(allowed)})"
+                )
+        for key, value in self.timing.words_per_second.items():
+            if value <= 0:
+                raise ConfigError(f"timing.words_per_second[{key!r}] must be > 0")
+        for level in self.audio.levels.intensity_offset_db:
+            if level not in (1, 2, 3, 4, 5):
+                raise ConfigError(
+                    f"audio.levels.intensity_offset_db has intensity {level}; expected 1..5"
+                )
+        return self
 
     @field_validator("languages", mode="before")
     @classmethod

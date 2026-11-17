@@ -25,7 +25,10 @@ packages = ["src/studio"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-markers = ["ffmpeg: requires ffmpeg/ffprobe on PATH (auto-skipped with a clear message if absent)"]
+markers = [
+  "ffmpeg: requires ffmpeg/ffprobe on PATH (auto-skipped with a clear message if absent)",
+  "slow: long-running integration coverage excluded from default CI; run on demand with -m slow",
+]
 
 [tool.mypy]
 strict = true

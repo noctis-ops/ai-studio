@@ -20,3 +20,56 @@ mock: {tts_chars_per_second: 15, video_width_16x9: 480, video_height_16x9: 270, 
        poll_ticks: 2}
 retention: {keep_raw_clips_days: 30, keep_narration_audio_days: 30}
 text_pipeline: {context_token_budget: 6000, tashkeel_retry: 1, s4_after_g1: true}
+
+# ---- Phase 3: voice + local audio engine ----
+doctor: {probe_timeout_s: 30}
+render: {fps: 24}          # validated: audio.sample_rate % fps == 0 (also: 25, 30). Else ConfigError.
+tts:
+  request_timeout_s: 120
+  use_context: true             # send previous_text/next_text when the model supports it
+  context_max_chars: 300
+  keep_diacritics: true         # false => send diacritics-stripped text (A/B knob; see `studio tts audition`)
+  qc: {min_duration_ratio: 0.4, max_duration_ratio: 2.5, auto_retries: 1}
+timing:                          # merged in Phase 3
+  max_stretch: 1.15
+  max_hold_ms: 500
+  j_cut_ms: 0                   # nonzero => ConfigError("not supported before Phase 5")
+  prefer_stretch_to_save_cost: true
+  estimate_drift_warn_pct: 25
+  lead_in_ms: 150               # implementer default (prompt gives no value)
+  line_gap_ms: 120              # implementer default (prompt gives no value)
+  tail_ms: 200                  # implementer default (prompt gives no value)
+  words_per_second: {ar: 2.5, en: 2.5}   # estimate; refine via `studio audio calibrate`
+audio:
+  sample_rate: 48000
+  library_root: library
+  scan_extensions: [".wav", ".mp3", ".flac", ".ogg"]
+  levels:                        # starting points, calibrate by ear
+    speech_line_lufs: -20
+    max_line_gain_db: 9
+    music_lufs: -24
+    ambience_lufs: -34
+    sfx_lufs: -22
+    intensity_offset_db: {1: -8, 2: -5, 3: -3, 4: -1, 5: 0}
+    intensity_ramp_ms: 800
+  speech_trim: {threshold_db: -50, keep_ms: 60}
+  music:
+    fade_in_ms: 1000
+    final_fade_ms: 2000
+    crossfade_ms: 1500
+    recent_penalty_episodes: 3
+    recent_penalty: 1.0
+    loop_penalty: 0.5
+    segment_intensity_break: 2
+  sfx: {transition_enabled: true, transition_tag: transition, transition_offset_ms: -150}
+  duck:
+    mode: envelope               # envelope | sidechain
+    depth_db: 10
+    pre_ms: 150                  # ramp-down starts this long before speech
+    attack_ms: 120               # ramp-down length; MUST be <= pre_ms (validated)
+    release_ms: 450
+    merge_gap_ms: 700            # speech gaps shorter than this stay ducked (no pumping)
+    ambience_fraction: 0.5
+    sidechain: {threshold: 0.05, ratio: 8, attack_ms: 20, release_ms: 350, makeup: 1}
+  master: {target_lufs: -14, true_peak_db: -1.5, lra: 11, lufs_tolerance: 1.0, tp_ceiling_db: -1.0, clip_peak_db: -0.1}
+  qc: {min_duck_db: 8, min_speech_to_music_db: 10, silent_line_rms_db: -45, window_ms: 100, exclude_onset_ms: 150}
