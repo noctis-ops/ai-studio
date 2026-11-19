@@ -1,11 +1,14 @@
-# AI Studio — Phase 3 (Voice and Audio)
+# AI Studio — Phase 4 (Media: fal.ai images/clips, visual QC, gates G0/G2)
 
 A local, single-operator pipeline that will orchestrate paid generative-AI APIs to
-produce cinematic animated videos. **Phase 3 ships the voice and audio engine:
-a real ElevenLabs TTS adapter (offline tests run on mocks), a local,
-deterministic audio pipeline (library scan, seeded selection, 24 fps timeline,
-ducking, mastering, persisted QC), and the S5a/S5/S6/S7/S7b stages.** The demo
-pipeline runs on mock providers, and that is what the test suite exercises.
+produce cinematic animated videos. **Phase 4 ships the paid media path: a raw
+httpx fal.ai adapter (offline tests run on mocks), the s4p/s10p preflights, the
+S8a/S8/S10 stages, ffmpeg-backed visual QC, deterministic clip conform, gate
+G0 (characters) and G2 (keyframes), and the media CLI (preview/QC/audition/smoke).**
+The demo pipeline runs on mock providers, and that is what the test suite
+exercises. Nothing here spends real money until the fal endpoints, prices and
+licences in `configs/model_registry.yaml` are confirmed by an operator
+(`studio doctor` lists every unconfirmed entry).
 
 Priorities, in order:
 
@@ -252,6 +255,59 @@ exercise `studio tts audition` / `T-EL-06` for real.
   `gates reject --shot <id>` creates a new attempt for **only** that shot and
   re-runs the affected stages. `final` never auto-approves.
 
+## Media pipeline (Phase 4)
+
+Paid media is strictly sequenced behind free, fail-closed preflights and human
+gates:
+
+```
+s4p_media_preflight (free) → s5a/s5 (TTS) → s6_timing → s7/s7b (audio)
+  → s8a_character_sheets (SERIES; gate G0_CHARACTERS — only if something was generated)
+  → s8_keyframes (SHOT; gate G2_KEYFRAMES) → s10p_clip_preflight (free, after G2)
+  → s10_clips (SHOT; raw paid clip is stored first, then conform is derived locally)
+```
+
+* **Preflights fail closed.** s4p lists every problem at once (unconfirmed
+  models, missing `FAL_KEY`, unsupported aspect/duration, ref capability,
+  never-verified price in final profile, over-budget) before any paid call.
+  s10p fails closed if a locked `clip_duration_ms` is not in the video model's
+  `supported_durations_s` (message: re-run S6).
+* **Crash resume repays nothing.** Attempt nonces are persisted before the
+  first submit; the cache key resumes the in-flight call instead of paying twice.
+* **Visual QC is ffmpeg/ffprobe only** (decode, min bytes, aspect, blackdetect,
+  freezedetect, first-frame luma/SSIM, audio presence). The SSIM check records
+  *luma* SSIM against the keyframe at clip size. No visual-LLM validation anywhere.
+* **Conform is derived, free and deterministic** — fps-normalize, trim/pad to
+  exactly `round(clip_duration_ms * timing.fps / 1000)` frames, strip audio,
+  SAR 1, libx264/yuv420p; already-compliant raws are referenced without re-encode.
+* **Gates.** G0 and G2 snapshot asset shas + prompts; approval flips rows and
+  lets the pipeline advance; rejection regenerates only the affected subjects.
+* **Circuit breaker (fail-fast).** Any shot that exhausts QC retries fails the
+  stage and the run; a single non-retryable QC failure raises
+  `MediaCircuitOpen` and writes a `media_circuit_open` audit row.
+* **Sanitizer** rewrites policy-refused scene text (level 1: light rewrite,
+  level 2: deterministic lexicon + stronger rewrite), never resubmits an
+  identical prompt, and parks the shot for a human after `sanitizer.max_levels`.
+
+Everything is gated by `model_registry.yaml`: fal entries ship as
+`<CONFIRM_FAL_ENDPOINT_ID>` placeholders with `needs_confirmation: true` and
+unverified pricing, so the final profile refuses to run until an operator
+confirms them (see `studio doctor`). The sandbox/draft profiles auto-approve
+and run on mock providers.
+
+```bash
+studio doctor                       # FAL_KEY, registry confirmation, media QC, ffmpeg filters
+python scripts/check_ffmpeg.py      # CI capability gate (audio + visual filter sets)
+studio run --demo --profile sandbox # mock media, no money
+studio media preview <run-id>       # local HTML preview of sheets/keyframes/clips
+studio media qc <attempt-id|sha|path>   # re-run visual QC on a stored asset
+studio media audition image --model-keys image.ref.draft --cap-usd 0.50 --yes   # opt-in, real fal calls
+studio media smoke --cap-usd 3.00 --yes      # opt-in live smoke (§Q), never in CI
+```
+
+Opt-in live tests: `STUDIO_LIVE_FAL=1 python -m pytest tests/test_phase4_fal.py -k live -q`
+(one image under $0.25, one shortest clip under $1.50). Nothing live runs in CI.
+
 ## Adding a provider (Phase 2+)
 
 1. Add the model to `configs/model_registry.yaml` with real pricing
@@ -275,9 +331,11 @@ auto-skip if the binaries are unavailable.
 
 ## License / status
 
-Phase 3 complete on this branch: text pipeline (Phase 2) + ElevenLabs TTS
-adapter + local audio engine (S5a–S7b). The demo path still runs on mock
-providers; real-provider calls are opt-in via environment flags. ElevenLabs
+Phase 4 complete on this branch: text pipeline (Phase 2) + ElevenLabs TTS
+adapter + local audio engine (S5a–S7b, Phase 3) + fal.ai media pipeline
+(S8a/S8/S10, visual QC, G0/G2) with placeholders for the real fal endpoints.
+The demo path runs on mock providers; real-provider calls are opt-in via
+environment flags and a confirmed registry. ElevenLabs
 model IDs and pricing are placeholders marked unverified. See
 `PHASE3_REPORT.md` for test results, coverage, deviations, decisions and
 known limitations (and `PHASE1_REPORT.md`, `PHASE2_REPORT.md` for earlier

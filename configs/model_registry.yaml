@@ -60,6 +60,7 @@ models:
     pricing_verified_on: null
     commercial_use_verified: false
     param_map: {prompt: prompt, refs: image_urls, aspect: aspect_ratio, seed: seed}
+    supports_refs: false                      # flux-dev-like: never used for keyframes in Phase 4
     needs_confirmation: true
   video.i2v.draft:
     provider: fal
@@ -72,6 +73,21 @@ models:
     pricing_verified_on: null
     commercial_use_verified: false
     param_map: {}
+    # Phase 4 merged media contract (never rename/delete existing keys).
+    media:
+      supported_aspects: ["9:16", "16:9"]
+      aspect_values: {"9:16": "<CONFIRM>", "16:9": "<CONFIRM>"}
+      aspect_extra_params: {}
+      supported_durations_s: [5, 10]
+      max_refs: 1
+      ref_style: single
+      param_map: {prompt: prompt, image: image_url, refs: image_urls, aspect: aspect_ratio,
+                  duration: duration, seed: seed, negative: negative_prompt}
+      param_formats: {duration: int}
+      fixed_params: {}
+      result_map: {asset_url: "video.url", seed: "seed", nsfw_flags: "has_nsfw_concepts"}
+      input_transport: data_uri
+      prompt_templates: {ref_clause: "The character {name} must look exactly like the character in reference image {n}."}
     needs_confirmation: true
   video.i2v.final:
     provider: fal
@@ -84,17 +100,127 @@ models:
     pricing_verified_on: null
     commercial_use_verified: false
     param_map: {}
+    media:
+      supported_aspects: ["9:16", "16:9"]
+      aspect_values: {"9:16": "<CONFIRM>", "16:9": "<CONFIRM>"}
+      aspect_extra_params: {}
+      supported_durations_s: [5, 10]
+      max_refs: 1
+      ref_style: single
+      param_map: {prompt: prompt, image: image_url, refs: image_urls, aspect: aspect_ratio,
+                  duration: duration, seed: seed, negative: negative_prompt}
+      param_formats: {duration: int}
+      fixed_params: {}
+      result_map: {asset_url: "video.url", seed: "seed", nsfw_flags: "has_nsfw_concepts"}
+      input_transport: data_uri
+      prompt_templates: {ref_clause: "The character {name} must look exactly like the character in reference image {n}."}
     needs_confirmation: true
+
+  # ---- Phase 4 additions (⚠ every endpoint / field / price is UNVERIFIED) ----
+  image.t2i.draft:
+    provider: fal
+    capability: image_reference_generate
+    endpoint_id: "<CONFIRM_FAL_ENDPOINT_ID>"
+    pricing: {unit: per_megapixel, usd: 0.0}
+    pricing_verified_on: null
+    commercial_use_verified: false
+    needs_confirmation: true
+    supports_refs: false
+    limits: {max_concurrency: 1, min_interval_s: 1.0}
+    media:
+      supported_aspects: ["9:16", "16:9"]
+      aspect_values: {"9:16": "<CONFIRM>", "16:9": "<CONFIRM>"}
+      aspect_extra_params: {}
+      supported_durations_s: []
+      max_refs: 0
+      ref_style: list
+      param_map: {prompt: prompt, aspect: aspect_ratio, seed: seed, negative: negative_prompt}
+      param_formats: {}
+      fixed_params: {}
+      result_map: {asset_url: "images.0.url", seed: "seed", nsfw_flags: "has_nsfw_concepts"}
+      input_transport: data_uri
+      prompt_templates: {ref_clause: "The character {name} must look exactly like the character in reference image {n}."}
+  image.ref.draft:
+    provider: fal
+    capability: image_reference_generate
+    endpoint_id: "<CONFIRM_FAL_ENDPOINT_ID>"
+    pricing: {unit: per_image, usd: 0.0}
+    pricing_verified_on: null
+    commercial_use_verified: false
+    needs_confirmation: true
+    supports_refs: true
+    limits: {max_concurrency: 1, min_interval_s: 1.0}
+    media:
+      supported_aspects: ["9:16", "16:9"]
+      aspect_values: {"9:16": "<CONFIRM>", "16:9": "<CONFIRM>"}
+      aspect_extra_params: {}
+      supported_durations_s: []
+      max_refs: 4
+      ref_style: list
+      param_map: {prompt: prompt, refs: image_urls, image: image_url, aspect: aspect_ratio,
+                  seed: seed, negative: negative_prompt}
+      param_formats: {}
+      fixed_params: {}
+      result_map: {asset_url: "images.0.url", seed: "seed", nsfw_flags: "has_nsfw_concepts"}
+      input_transport: data_uri
+      prompt_templates: {ref_clause: "The character {name} must look exactly like the character in reference image {n}."}
+  image.ref.final:
+    provider: fal
+    capability: image_reference_generate
+    endpoint_id: "<CONFIRM_FAL_ENDPOINT_ID>"
+    pricing: {unit: per_video, usd: 0.0}      # unit exercised by the adapter; price is a placeholder
+    pricing_verified_on: null
+    commercial_use_verified: false
+    needs_confirmation: true
+    supports_refs: true
+    limits: {max_concurrency: 1, min_interval_s: 1.0}
+    media:
+      supported_aspects: ["9:16", "16:9"]
+      aspect_values: {"9:16": "<CONFIRM>", "16:9": "<CONFIRM>"}
+      aspect_extra_params: {}
+      supported_durations_s: []
+      max_refs: 4
+      ref_style: list
+      param_map: {prompt: prompt, refs: image_urls, image: image_url, aspect: aspect_ratio,
+                  seed: seed, negative: negative_prompt}
+      param_formats: {}
+      fixed_params: {}
+      result_map: {asset_url: "images.0.url", seed: "seed", nsfw_flags: "has_nsfw_concepts"}
+      input_transport: data_uri
+      prompt_templates: {ref_clause: "The character {name} must look exactly like the character in reference image {n}."}
   mock.llm:   {provider: mock, capability: llm,   model_id: mock-llm,   simulated: true,
                pricing: {unit: per_1m_tokens, in_usd: 0.0, out_usd: 0.0}, commercial_use_verified: true}
   mock.tts:   {provider: mock, capability: tts,   model_id: mock-tts,   simulated: true,
                pricing: {unit: per_1k_chars, usd: 0.0}, commercial_use_verified: true}
   mock.image: {provider: mock, capability: image_reference_generate, endpoint_id: mock-image, simulated: true,
-               pricing: {unit: per_image, usd: 0.0}, commercial_use_verified: true}
+               pricing: {unit: per_image, usd: 0.0}, commercial_use_verified: true,
+               supports_refs: true,
+               media: {supported_aspects: ["9:16", "16:9"],
+                       aspect_values: {"9:16": "9:16", "16:9": "16:9"},
+                       aspect_extra_params: {}, supported_durations_s: [],
+                       max_refs: 4, ref_style: list,
+                       param_map: {prompt: prompt, refs: image_urls, image: image_url,
+                                   aspect: aspect_ratio, seed: seed, negative: negative_prompt},
+                       param_formats: {}, fixed_params: {},
+                       result_map: {asset_url: "images.0.url", seed: "seed"},
+                       input_transport: data_uri,
+                       prompt_templates: {ref_clause: "The character {name} must look exactly like the character in reference image {n}."}}}
   mock.video: {provider: mock, capability: image_to_video, endpoint_id: mock-video, simulated: true,
                supported_aspects: ["16:9","9:16"], supported_durations_s: [5, 10], max_resolution: "720p",
-               pricing: {unit: per_second, usd: 0.0}, commercial_use_verified: true}
+               pricing: {unit: per_second, usd: 0.0}, commercial_use_verified: true,
+               media: {supported_aspects: ["9:16", "16:9"],
+                       aspect_values: {"9:16": "9:16", "16:9": "16:9"},
+                       aspect_extra_params: {}, supported_durations_s: [5, 10],
+                       max_refs: 1, ref_style: single,
+                       param_map: {prompt: prompt, image: image_url, refs: image_urls,
+                                   aspect: aspect_ratio, duration: duration, seed: seed,
+                                   negative: negative_prompt},
+                       param_formats: {duration: int}, fixed_params: {},
+                       result_map: {asset_url: "video.url", seed: "seed"},
+                       input_transport: data_uri,
+                       prompt_templates: {ref_clause: "The character {name} must look exactly like the character in reference image {n}."}}}
 profiles:
   sandbox: {llm_creative: mock.llm, llm_light: mock.llm, tts: mock.tts, keyframe: mock.image, video: mock.video}
-  draft:   {llm_creative: llm.light, llm_light: llm.light, tts: tts.main, keyframe: image.keyframe, video: video.i2v.draft}
+  # H4 / Finding #8: the draft creative role is llm.creative (was llm.light).
+  draft:   {llm_creative: llm.creative, llm_light: llm.light, tts: tts.main, keyframe: image.keyframe, video: video.i2v.draft}
   final:   {llm_creative: llm.creative, llm_light: llm.light, tts: tts.main, keyframe: image.keyframe, video: video.i2v.final}

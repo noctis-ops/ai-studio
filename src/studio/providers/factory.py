@@ -4,8 +4,8 @@
 Phase 1 behavior). `anthropic` / `openai` bind lazily to the Phase 2 LLM
 adapters (a missing SDK surfaces as ConfigError at client construction time).
 `elevenlabs` binds to the Phase 3 ElevenLabs TTS adapter (raw httpx, no SDK).
-Anything else is a ConfigError naming the provider and the phase that will
-implement it.
+`fal` binds to the Phase 4 fal queue adapter (raw httpx, no SDK).
+Anything else is a ConfigError naming the provider.
 """
 
 from __future__ import annotations
@@ -35,9 +35,7 @@ _REAL_TTS_ADAPTERS: dict[str, tuple[str, str]] = {
     "elevenlabs": ("studio.providers.tts.elevenlabs", "ElevenLabsTTSProvider"),
 }
 
-_FUTURE_PROVIDERS: dict[str, str] = {
-    "fal": "Phase 4 (image/video)",
-}
+_FUTURE_PROVIDERS: dict[str, str] = {}
 
 
 def build_provider(
@@ -72,11 +70,16 @@ def build_provider(
         adapter_cls = getattr(module, class_name)
         timeout_s = float(getattr(settings.tts, "request_timeout_s", 120.0))
         return adapter_cls(entry, timeout_s=timeout_s)
-    future = _FUTURE_PROVIDERS.get(entry.provider)
-    if future is not None:
+    if entry.provider == "fal":
+        from studio.providers.fal.adapter import build_fal
+
+        if entry.capability == "image_reference_generate":
+            return build_fal(entry, kind="image", settings=settings)
+        if entry.capability == "image_to_video":
+            return build_fal(entry, kind="video", settings=settings)
         raise ConfigError(
-            f"provider {entry.provider!r} is not implemented in this phase ({future}); "
-            f"no adapter is registered for capability {entry.capability!r}"
+            f"provider 'fal' adapter only supports image/video capabilities, "
+            f"got {entry.capability!r}"
         )
     known = ", ".join(
         sorted(["mock", *_REAL_LLM_ADAPTERS, *_REAL_TTS_ADAPTERS, *_FUTURE_PROVIDERS])

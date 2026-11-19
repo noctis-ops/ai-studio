@@ -404,7 +404,7 @@ async def test_request_changes_reexecutes_only_the_rejected_shot(
         "SELECT stage, subject_id FROM stage_runs WHERE status = 'stale'"
     ).fetchall()
     staled_set = {(r["stage"], r["subject_id"]) for r in staled}
-    assert staled_set == {("demo_keyframes", target_shot)}
+    assert staled_set == {("s8_keyframes", target_shot)}
 
     # attempts: shot 2 now has attempt 2 with a fresh nonce; others still attempt 1
     attempts = db.connect().execute(
@@ -502,8 +502,8 @@ async def test_gate_lifecycle_blocks_and_releases_the_pipeline(tmp_path, monkeyp
         ).fetchall()
     }
     assert counts["demo_voice"] == 1
-    assert counts["demo_keyframes"] == 3
-    assert "demo_clips" not in counts  # G2 blocks clips
+    assert counts["s8_keyframes"] == 3
+    assert "s10_clips" not in counts  # G2 blocks clips
 
     g2 = db.connect().execute(
         "SELECT id FROM approval_gates WHERE gate = 'G2_KEYFRAMES' ORDER BY round DESC LIMIT 1"
@@ -604,6 +604,11 @@ async def test_budget_halt_then_resume_completes_without_repaying(
 
 # ======================================================================
 # T-ENG-08
+# Phase 4 §M formula (explicitly authorized by §O): expected image calls =
+# shots + characters-without-approved-sheets x roles; video calls = shots;
+# TTS calls scale with languages. The demo seed pins no bible, so the sheet
+# term is 0 and the counts stay at shots; the formula is computed from repo
+# state instead of asserted as a bare 3.
 # ======================================================================
 
 
@@ -613,6 +618,7 @@ async def test_language_toggle_doubles_tts_but_not_image_or_video(
     tmp_path, monkeypatch
 ):
     counts = {}
+    expected = {}
     for idx, languages in enumerate((("ar",), ("ar", "en"))):
         config, db, clock, ids, repos, _home = _env(
             tmp_path, monkeypatch, filename=f"englang{idx}", paid=False
@@ -621,19 +627,109 @@ async def test_language_toggle_doubles_tts_but_not_image_or_video(
             config, repos, ids, languages=languages, aspects=("9:16",), auto_approve=True
         )
         engine, _dag = _engine(db, repos, config, clock, ids)
+        # §M formula: shots + characters-without-approved-sheets x roles.
+        # Measure the missing set before the drain (the run generates+approves
+        # sheets); the demo seed pins no bible, so this is 0 and image calls
+        # stay at shots.
+        from studio.media.stages import _sheet_precheck_subjects
+
+        run = repos.pipeline.get_run(_run_row.id)
+        assert run is not None
+        precheck_ctx = engine._context(run, None)
+        missing_sheets = len(_sheet_precheck_subjects(precheck_ctx))
         worker = _worker(db, engine, repos, config, clock, ids)
         await _drain(worker)
         rows = db.connect().execute(
             "SELECT capability, count(*) AS n FROM provider_calls GROUP BY capability"
         ).fetchall()
         counts[languages] = {r["capability"]: r["n"] for r in rows}
+        shots = db.connect().execute("SELECT count(*) FROM shots").fetchone()[0]
+        expected[languages] = shots + missing_sheets
 
     ar_only = counts[("ar",)]
     bilingual = counts[("ar", "en")]
     assert ar_only["tts"] == 3
     assert bilingual["tts"] == 6
-    assert ar_only["image_reference_generate"] == bilingual["image_reference_generate"] == 3
+    assert ar_only["image_reference_generate"] == expected[("ar",)] == 3
+    assert bilingual["image_reference_generate"] == expected[("ar", "en")] == 3
     assert ar_only["image_to_video"] == bilingual["image_to_video"] == 3
+
+
+# ======================================================================
+# T-ENG-14 — sandbox demo DAG through S10 with mocks (real handlers),
+# including counts and the T-ENG-08 formula (Phase 4 §M)
+# ======================================================================
+
+
+@pytest.mark.ffmpeg
+@pytest.mark.asyncio
+async def test_demo_dag_through_s10_counts_and_formula(tmp_path, monkeypatch):
+    config, db, clock, ids, repos, _home = _env(
+        tmp_path, monkeypatch, filename="engs10", paid=False
+    )
+    _seeded, run_row = _seed_run(
+        config, repos, ids, languages=("ar",), aspects=("9:16",), auto_approve=True
+    )
+    engine, _dag = _engine(db, repos, config, clock, ids)
+
+    # The §M formula is computed from repo state, not asserted as a bare 3:
+    # image calls = shots + characters-without-approved-sheets x roles.
+    from studio.media.stages import _sheet_precheck_subjects
+
+    run = repos.pipeline.get_run(run_row.id)
+    assert run is not None
+    missing_sheets = len(_sheet_precheck_subjects(engine._context(run, None)))
+    roles = len(config.settings.character_sheets.roles)
+
+    worker = _worker(db, engine, repos, config, clock, ids)
+    await _drain(worker)
+    run = repos.pipeline.get_run(run_row.id)
+    assert run is not None and run.status == RunStatus.COMPLETED.value
+
+    shots = db.connect().execute("SELECT count(*) FROM shots").fetchone()[0]
+    lines = db.connect().execute("SELECT count(*) FROM narration_lines").fetchone()[0]
+    counts = {
+        row["capability"]: row["n"]
+        for row in db.connect().execute(
+            "SELECT capability, count(*) AS n FROM provider_calls GROUP BY capability"
+        ).fetchall()
+    }
+
+    assert counts["tts"] == lines
+    assert counts["image_reference_generate"] == shots + missing_sheets * roles
+    assert counts["image_to_video"] == shots
+    # locked S6 values are untouched by S10; every conformed clip carries
+    # exactly locked-duration frames at the render fps
+    from studio.media.conform import clip_frames_for
+
+    fps = int(config.settings.render.fps)
+    locked = {
+        row["id"]: int(row["clip_duration_ms"])
+        for row in db.connect().execute(
+            "SELECT id, clip_duration_ms FROM shots"
+        ).fetchall()
+    }
+    assert locked and all(ms and ms > 0 for ms in locked.values())
+    clip_rows = db.connect().execute(
+        "SELECT output_json FROM stage_runs WHERE stage = 's10_clips' "
+        "AND status = 'succeeded'"
+    ).fetchall()
+    assert len(clip_rows) == shots
+    for row in clip_rows:
+        out = json.loads(row["output_json"])
+        locked_ms = locked[out["shot_id"]]
+        assert out["clip_duration_ms"] == locked_ms
+        assert out["fps"] == fps
+        assert out["clip_frames"] == clip_frames_for(locked_ms, fps)
+    for shot_id, locked_ms in locked.items():
+        after = db.connect().execute(
+            "SELECT clip_duration_ms FROM shots WHERE id = ?", (shot_id,)
+        ).fetchone()["clip_duration_ms"]
+        assert after == locked_ms
+    final_row = db.connect().execute(
+        "SELECT status FROM stage_runs WHERE stage = 'demo_finalize'"
+    ).fetchone()
+    assert final_row is not None and final_row["status"] == "succeeded"
 
 
 # ======================================================================
@@ -659,8 +755,8 @@ async def test_aspects_toggle(tmp_path, monkeypatch):
     # mock video output aspect equals track aspect (ffprobe on CAS assets)
     for track in tracks:
         row = db.connect().execute(
-            "SELECT a.rel_path FROM stage_runs sr JOIN assets a ON a.sha256 = json_extract(sr.output_json, '$.asset_sha256s[0]') "
-            "WHERE sr.stage = 'demo_clips' AND sr.subject_id IN ("
+            "SELECT a.rel_path FROM stage_runs sr JOIN assets a ON a.sha256 = COALESCE(json_extract(sr.output_json, '$.conformed_asset_id'), json_extract(sr.output_json, '$.asset_sha256')) "
+            "WHERE sr.stage = 's10_clips' AND sr.subject_id IN ("
             "  SELECT id FROM shots WHERE track_id = ?"
             ") LIMIT 1",
             (track["id"],),
@@ -668,9 +764,9 @@ async def test_aspects_toggle(tmp_path, monkeypatch):
         assert row is not None
         result = probe(Path(config.settings.paths.cas) / row["rel_path"])
         if track["aspect"] == "9:16":
-            assert (result.width, result.height) == (270, 480)
+            assert (result.width, result.height) == (540, 960)
         else:
-            assert (result.width, result.height) == (480, 270)
+            assert (result.width, result.height) == (960, 540)
 
 
 # ======================================================================
@@ -794,7 +890,7 @@ def test_recovery_resets_stale_jobs_and_orphaned_stage_runs(tmp_path, monkeypatc
     # also an orphaned running stage_run with no job at all
     orphan = repos.pipeline.create_stage_run(
         run_id=run_row.id,
-        stage="demo_keyframes",
+        stage="s8_keyframes",
         subject=SubjectRef(
             scope=Scope.SHOT,
             id="shot-orphan",
@@ -918,12 +1014,15 @@ async def test_invalidation_cascades_downstream_and_reruns_for_free(
             invalidated_ids,
         ).fetchall()
     }
-    # Phase 3: the audio chain (s5a/s5/s6/s7/s7b) joins the staleness graph —
-    # a G2 script edit invalidates it too. demo_voice remains (line materializer).
+    # Phase 3+4: the audio chain (s5a/s5/s6/s7/s7b) and the media chain
+    # (s4p/s8/s10p/s10) join the staleness graph — an episode-level edit
+    # invalidates everything downstream. demo_voice remains (line materializer).
+    # s8a_character_sheets has no stage_run rows (no bible in the demo seed).
     assert stages == {
-        "demo_script", "demo_voice", "s5a_tts_preflight", "s5_tts", "s6_timing",
+        "demo_script", "s4p_media_preflight", "demo_voice",
+        "s5a_tts_preflight", "s5_tts", "s6_timing",
         "s7_audio_plan", "s7b_audio_mix",
-        "demo_keyframes", "demo_clips", "demo_finalize",
+        "s8_keyframes", "s10p_clip_preflight", "s10_clips", "demo_finalize",
     }
     # the pending rows are re-enqueued incrementally: script goes first, the
     # rest follow as dependency stages complete (job completion enqueues advance)
@@ -1072,7 +1171,7 @@ def test_gate_create_policy_violations_and_shot_anchor(tmp_path, monkeypatch):
     # sandbox profile with draft-only allow-list is refused
     try:
         gates.create_gate_round(
-            run_id=run_row.id, stage="demo_keyframes", gate=GateKind.G2_KEYFRAMES,
+            run_id=run_row.id, stage="s8_keyframes", gate=GateKind.G2_KEYFRAMES,
             snapshot_hash="abc", profile="sandbox", auto_approve=True,
             allow_auto_approve_in=[Profile.DRAFT],
         )

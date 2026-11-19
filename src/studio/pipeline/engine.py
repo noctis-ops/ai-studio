@@ -8,7 +8,6 @@ persistence-first and idempotent everywhere.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 from datetime import timedelta
@@ -18,10 +17,11 @@ from typing import TYPE_CHECKING, Any
 from studio.config.languages import resolve_languages
 from studio.config.loader import AppConfig
 from studio.core.budget import LedgerService
-from studio.core.canonical import canonical_json, canonical_text
+from studio.core.canonical import canonical_text
 from studio.core.cas import ContentStore
 from studio.core.clock import Clock, format_ts
 from studio.core.faults import SimulatedCrash
+from studio.core.gateway import GATE_CLEARED_VAR
 from studio.core.ids import Ids, UlidIds
 from studio.db.connection import Database
 from studio.db.repos import StudioRepos
@@ -37,7 +37,7 @@ from studio.domain.models import JobRow, PipelineRunRow, StageRunRow
 from studio.domain.refs import SubjectRef, subjects_related
 from studio.pipeline.dag import Dag
 from studio.pipeline.gates import GateService
-from studio.pipeline.stage import StageOutput, StageSpec
+from studio.pipeline.stage import StageHandler, StageOutput, StageSpec
 
 if TYPE_CHECKING:
     from studio.core.gateway import ProviderGateway
@@ -150,8 +150,8 @@ class Engine:
             episode_id=run.episode_id,
             languages=languages,
             aspects=aspects,
-            stage_run_id=stage_run_id,
-        )
+        stage_run_id=stage_run_id,
+    )
 
     # ==================================================================
     # advance_run: eligibility, enumeration, gates, completion
@@ -257,16 +257,9 @@ class Engine:
             )
 
     def _deps_complete(self, run_id: str, spec: StageSpec) -> bool:
-        for dep in spec.depends_on:
-            if not self.repos.pipeline.is_enumerated(run_id, dep):
-                return False
-            rows = self.repos.pipeline.list_stage_runs(run_id, stage=dep)
-            for row in rows:
-                if row.status in _STAGE_LIVE:
-                    return False
-                if row.status == "failed":
-                    return False
-        return True
+        from studio.pipeline.deps import direct_deps_complete
+
+        return direct_deps_complete(self.repos, self.dag, run_id, spec.name)
 
     # ---- staleness (rule 4) ----------------------------------------------
 
@@ -381,8 +374,9 @@ class Engine:
 
     @staticmethod
     def _gate_snapshot_hash(rows: list[StageRunRow]) -> str:
-        items = sorted((r.id, r.output_json or "") for r in rows)
-        return hashlib.sha256(canonical_json(items)).hexdigest()
+        from studio.pipeline.barrier import stage_outputs_snapshot_hash
+
+        return stage_outputs_snapshot_hash(rows)
 
     def _maybe_complete(self, run_id: str) -> None:
         run = self.repos.pipeline.get_run(run_id)
@@ -463,6 +457,49 @@ class Engine:
         subject = subject_from_stage_run(row)
         ctx = self._context(run, stage_run_id)
 
+        # ---- H0: paid-stage gate barrier --------------------------------
+        # This runs BEFORE input_hash/run: a speculative job claimed while a
+        # gate is pending must never reach a handler that can spend money.
+        if spec.spends_money:
+            from studio.pipeline.barrier import ancestor_gate_problems
+
+            ctx.gate_cleared = False
+            problems = ancestor_gate_problems(
+                repos=self.repos, dag=self.dag, run_id=run.id, stage_id=spec.name
+            )
+            if problems:
+                self.repos.jobs.complete(job.id)
+                self.repos.audit.append(
+                    actor="system",
+                    entity=f"stage_run:{stage_run_id}",
+                    event="paid_stage_deferred",
+                    payload={
+                        "run_id": run.id,
+                        "stage": spec.name,
+                        "subject": subject.id,
+                        "problems": problems,
+                    },
+                )
+                return
+            ctx.gate_cleared = True
+        token = GATE_CLEARED_VAR.set(ctx.gate_cleared)
+        try:
+            await self._execute_stage_job(job, run, row, spec, handler, subject, ctx)
+        finally:
+            GATE_CLEARED_VAR.reset(token)
+
+    async def _execute_stage_job(
+        self,
+        job: JobRow,
+        run: PipelineRunRow,
+        row: StageRunRow,
+        spec: StageSpec,
+        handler: StageHandler,
+        subject: SubjectRef,
+        ctx: RunContext,
+    ) -> None:
+        """Body of a claimed run_stage job (H0 context var is held by the caller)."""
+        stage_run_id = row.id
         # Rule 4 again: don't execute against changed inputs.
         try:
             current_hash = handler.input_hash(ctx, subject)

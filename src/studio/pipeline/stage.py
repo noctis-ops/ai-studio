@@ -27,6 +27,10 @@ class StageSpec:
     depends_on: tuple[str, ...]
     handler: StageHandler
     gate_after: GateKind | None = None
+    # Phase 4 H0: paid stages must prove that every ancestor gate round is
+    # both approved and still bound to the current stage outputs before the
+    # handler is entered. Free stages are unaffected.
+    spends_money: bool = False
 
 
 @dataclass(frozen=True)

@@ -417,6 +417,8 @@ def test_prices_unchanged_on_shipped_registry(monkeypatch):
 def test_registry_subset_resolves_but_full_draft_still_refuses(tmp_path, monkeypatch):
     config = _config(tmp_path, monkeypatch)
     subset = config.registry.resolve_llm_subset("draft")
-    assert subset.model_keys == {"llm_creative": "llm.light", "llm_light": "llm.light"}
+    # H4 (Finding #8): the draft creative role is llm.creative; only the
+    # light role still uses gpt-4o-mini.
+    assert subset.model_keys == {"llm_creative": "llm.creative", "llm_light": "llm.light"}
     with pytest.raises(RegistryError):
         config.registry.resolve_profile("draft")

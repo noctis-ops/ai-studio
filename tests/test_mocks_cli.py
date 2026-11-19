@@ -224,7 +224,8 @@ def test_cli_03_library_scan_voice_set_run_preview_doctor(tmp_path, monkeypatch)
     # scan on a home without a library yet: warns, exits 0
     result = runner.invoke(app, ["library", "scan"])
     assert result.exit_code == 0, result.output
-    assert "does not exist" in result.output
+    # rich wraps at console width; normalize whitespace before the substring check
+    assert "does not exist" in " ".join(result.output.split())
 
     # seed the demo sandbox (fixtures land under <home>/library)
     result = runner.invoke(app, ["run", "--demo", "--profile", "sandbox"])

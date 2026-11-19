@@ -18,6 +18,7 @@ from .gates import GatesRepo, SqliteGatesRepo
 from .jobs import JobsRepo, SqliteJobsRepo
 from .pipeline import PipelineRepo, SqlitePipelineRepo, subject_from_stage_run
 from .providers import NewCacheEntry, NewCall, ProvidersRepo, SqliteProvidersRepo
+from .sheets import SheetsRepo, SqliteSheetsRepo
 
 __all__ = [
     "AssetsRepo",
@@ -33,6 +34,7 @@ __all__ = [
     "NewCall",
     "PipelineRepo",
     "ProvidersRepo",
+    "SheetsRepo",
     "SqliteAssetsRepo",
     "SqliteAudioRepo",
     "SqliteAuditRepo",
@@ -43,6 +45,7 @@ __all__ = [
     "SqliteJobsRepo",
     "SqlitePipelineRepo",
     "SqliteProvidersRepo",
+    "SqliteSheetsRepo",
     "StudioRepos",
     "build_repos",
     "subject_from_stage_run",
@@ -61,6 +64,7 @@ class StudioRepos:
     gates: GatesRepo
     content: ContentRepo
     audit: AuditRepo
+    sheets: SheetsRepo
 
 
 def build_repos(db: Database, clock: Clock, ids: Ids | None = None) -> StudioRepos:
@@ -75,4 +79,5 @@ def build_repos(db: Database, clock: Clock, ids: Ids | None = None) -> StudioRep
         gates=SqliteGatesRepo(db, clock, ids),
         content=SqliteContentRepo(db, clock, ids),
         audit=SqliteAuditRepo(db, clock, ids),
+        sheets=SqliteSheetsRepo(db, clock, ids),
     )

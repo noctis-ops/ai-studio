@@ -1,11 +1,15 @@
 """Demo stage handlers. All external calls flow through the Gateway;
 all handlers are idempotent.
 
-Stages (BEGIN_PROMPT §H8):
+Stages (BEGIN_PROMPT §H8, Phase 4 §M):
     demo_script     episode      -> llm (demo_shots) -> creates shots per track
     demo_voice      deliverable  -> materializes narration_lines (Phase 3: TTS moved to s5_tts)
-    demo_keyframes  shot         -> image per shot (current shot_attempts nonce)
-    demo_clips      shot         -> video per shot (keyframe + narration duration)
+    s4p_media_preflight episode   -> free, fail-closed model/budget preflight
+    s5_tts -> s6_timing -> s7_audio_plan -> s7b_audio_mix  (shared handlers)
+    s8a_character_sheets series   -> sheets per (character, role); Gate G0 (only when generated)
+    s8_keyframes    shot         -> image per shot; Gate G2
+    s10p_clip_preflight episode  -> free, fail-closed clip preflight
+    s10_clips       shot         -> video per shot (locked S6 duration, conform)
     demo_finalize   deliverable  -> manifest JSON asset
 """
 
@@ -19,14 +23,21 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from studio.domain.models import EpisodeRow, ShotAttemptRow, ShotRow, TrackRow
+    from studio.domain.models import EpisodeRow, ShotRow
     from studio.pipeline.context import RunContext
 
 from studio.core.canonical import canonical_json
 from studio.core.gateway import CallContext
-from studio.domain.enums import Aspect, GateKind, Scope
+from studio.domain.enums import GateKind, Scope
 from studio.domain.errors import PermanentProviderError
-from studio.domain.refs import AssetRef, SubjectRef
+from studio.domain.refs import SubjectRef
+from studio.media.stages import (
+    CharacterSheetHandler,
+    ClipGenHandler,
+    ClipPreflightHandler,
+    KeyframeHandler,
+    MediaPreflightHandler,
+)
 from studio.pipeline.stage import StageOutput, StageSpec
 from studio.pipeline.stages_audio import (
     AudioMixHandler,
@@ -35,7 +46,7 @@ from studio.pipeline.stages_audio import (
     TtsLineHandler,
     TtsPreflightHandler,
 )
-from studio.providers.base import LLMRequest, MediaRequest
+from studio.providers.base import LLMRequest
 
 _SCRIPT_SCHEMA = "demo_shots"
 _MANIFEST_VERSION = 1
@@ -43,10 +54,6 @@ _MANIFEST_VERSION = 1
 
 def _sha(obj: Any) -> str:
     return hashlib.sha256(canonical_json(obj)).hexdigest()
-
-
-def _seed_from_nonce(nonce: str) -> int:
-    return int(hashlib.sha256(nonce.encode("utf-8")).hexdigest(), 16) % (2**31)
 
 
 def _episode(ctx: RunContext) -> EpisodeRow | None:
@@ -103,15 +110,6 @@ def _stage_output(ctx: RunContext, stage: str, subject_id: str) -> dict[str, Any
                 continue
     return None
 
-
-def _quantize_duration(needed_s: float, supported: list[int]) -> int:
-    if not supported:
-        return max(1, int(needed_s) if needed_s == int(needed_s) else int(needed_s) + 1)
-    ordered = sorted(supported)
-    for duration in ordered:
-        if duration >= needed_s:
-            return duration
-    return ordered[-1]
 
 
 def narration_text(shot: ShotRow) -> str:
@@ -329,175 +327,6 @@ class DemoVoiceHandler:
 
 
 # ==================================================================
-# demo_keyframes
-# ==================================================================
-
-
-class DemoKeyframesHandler:
-    def subjects(self, ctx: RunContext) -> list[SubjectRef]:
-        return _shot_subjects(ctx)
-
-    def _attempt(self, ctx: RunContext, shot: ShotRow) -> ShotAttemptRow | None:
-        return ctx.repos.content.current_shot_attempt(shot.id)
-
-    def input_hash(self, ctx: RunContext, subject: SubjectRef) -> str:
-        shot = ctx.repos.content.get_shot(subject.id)
-        assert shot is not None
-        track = ctx.repos.content.get_track(shot.track_id)
-        assert track is not None
-        attempt = self._attempt(ctx, shot)
-        return _sha(
-            {
-                "stage": "demo_keyframes",
-                "shot_id": shot.id,
-                "attempt_no": attempt.attempt_no if attempt else 0,
-                "nonce": attempt.nonce if attempt else None,
-                "prompt": attempt.prompt_used if attempt else shot.prompt,
-                "image": ctx.resolved_profile.model_key_for("keyframe"),
-                "aspect": track.aspect,
-            }
-        )
-
-    async def run(self, ctx: RunContext, subject: SubjectRef) -> StageOutput:
-        shot = ctx.repos.content.get_shot(subject.id)
-        if shot is None:
-            raise PermanentProviderError(f"shot not found: {subject.id}")
-        track = ctx.repos.content.get_track(shot.track_id)
-        assert track is not None
-        attempt = self._attempt(ctx, shot)
-        if attempt is None:
-            attempt = ctx.repos.content.create_shot_attempt(
-                shot_id=shot.id, attempt_no=1, nonce=ctx.ids.new(), prompt_used=shot.prompt
-            )
-        model_key = ctx.resolved_profile.model_key_for("keyframe")
-        seed = _seed_from_nonce(attempt.nonce)
-        result = await ctx.gateway.image(
-            model_key,
-            MediaRequest(
-                capability="image_reference_generate",
-                params={"prompt": attempt.prompt_used},
-                input_assets=[],
-                aspect=Aspect(track.aspect),
-                duration_s=None,
-                seed=seed,
-            ),
-            CallContext(
-                episode_id=ctx.episode_id,
-                stage_run_id=ctx.stage_run_id,
-                nonce="0",
-                purpose="keyframe",
-            ),
-        )
-        return StageOutput(
-            output={
-                "shot_id": shot.id,
-                "attempt_no": attempt.attempt_no,
-                "asset_sha256s": [a.sha256 for a in result.assets],
-            }
-        )
-
-
-# ==================================================================
-# demo_clips
-# ==================================================================
-
-
-class DemoClipsHandler:
-    def subjects(self, ctx: RunContext) -> list[SubjectRef]:
-        return _shot_subjects(ctx)
-
-    def _duration_s(self, ctx: RunContext, track: TrackRow, shot: ShotRow) -> int:
-        entry = ctx.resolved_profile.entry_for("video")
-        needed_ms = ctx.repos.content.narration_max_duration_ms(track.id, shot.id)
-        needed_s = (needed_ms / 1000.0) if needed_ms else 0.0
-        if needed_s <= 0:
-            supported = sorted(entry.supported_durations_s)
-            return supported[0] if supported else 5
-        import math
-
-        return _quantize_duration(math.ceil(needed_s), list(entry.supported_durations_s))
-
-    def input_hash(self, ctx: RunContext, subject: SubjectRef) -> str:
-        shot = ctx.repos.content.get_shot(subject.id)
-        assert shot is not None
-        track = ctx.repos.content.get_track(shot.track_id)
-        assert track is not None
-        attempt = ctx.repos.content.current_shot_attempt(shot.id)
-        keyframe = _stage_output(ctx, "demo_keyframes", shot.id) or {}
-        return _sha(
-            {
-                "stage": "demo_clips",
-                "shot_id": shot.id,
-                "attempt_no": attempt.attempt_no if attempt else 0,
-                "keyframe_sha256": (keyframe.get("asset_sha256s") or [None])[0],
-                "duration_s": self._duration_s(ctx, track, shot),
-                "video": ctx.resolved_profile.model_key_for("video"),
-                "aspect": track.aspect,
-            }
-        )
-
-    async def run(self, ctx: RunContext, subject: SubjectRef) -> StageOutput:
-        shot = ctx.repos.content.get_shot(subject.id)
-        if shot is None:
-            raise PermanentProviderError(f"shot not found: {subject.id}")
-        track = ctx.repos.content.get_track(shot.track_id)
-        assert track is not None
-        attempt = ctx.repos.content.current_shot_attempt(shot.id)
-        if attempt is None:
-            raise PermanentProviderError(
-                f"shot {shot.id} has no attempts; run demo_keyframes first"
-            )
-        keyframe = _stage_output(ctx, "demo_keyframes", shot.id)
-        keyframe_shas = (keyframe or {}).get("asset_sha256s") or []
-        if not keyframe_shas:
-            raise PermanentProviderError(
-                f"shot {shot.id} has no keyframe asset; run demo_keyframes first"
-            )
-        keyframe_row = ctx.repos.assets.get(keyframe_shas[0])
-        if keyframe_row is None:
-            raise PermanentProviderError(f"keyframe asset missing for shot {shot.id}")
-        aspect = Aspect(track.aspect)
-        duration_s = self._duration_s(ctx, track, shot)
-        ref = AssetRef(
-            sha256=keyframe_row.sha256,
-            rel_path=keyframe_row.rel_path,
-            kind=keyframe_row.kind,
-            mime=keyframe_row.mime,
-            size_bytes=keyframe_row.size_bytes,
-            duration_ms=keyframe_row.duration_ms,
-            width=keyframe_row.width,
-            height=keyframe_row.height,
-        )
-        model_key = ctx.resolved_profile.model_key_for("video")
-        seed = _seed_from_nonce(attempt.nonce)
-        result = await ctx.gateway.video(
-            model_key,
-            MediaRequest(
-                capability="image_to_video",
-                params={"prompt": attempt.prompt_used},
-                input_assets=[ref],
-                aspect=aspect,
-                duration_s=float(duration_s),
-                seed=seed,
-            ),
-            CallContext(
-                episode_id=ctx.episode_id,
-                stage_run_id=ctx.stage_run_id,
-                nonce="0",
-                purpose="clip",
-            ),
-        )
-        return StageOutput(
-            output={
-                "shot_id": shot.id,
-                "attempt_no": attempt.attempt_no,
-                "duration_s": duration_s,
-                "asset_sha256s": [a.sha256 for a in result.assets],
-            }
-        )
-
-
-# ==================================================================
 # demo_finalize
 # ==================================================================
 
@@ -508,7 +337,7 @@ class DemoFinalizeHandler:
 
     def _clip_map(self, ctx: RunContext, track_id: str) -> dict[str, dict[str, Any]]:
         clips: dict[str, dict[str, Any]] = {}
-        for row in ctx.repos.pipeline.list_stage_runs(ctx.run_id, stage="demo_clips"):
+        for row in ctx.repos.pipeline.list_stage_runs(ctx.run_id, stage="s10_clips"):
             if row.status != "succeeded" or not row.output_json:
                 continue
             try:
@@ -518,6 +347,11 @@ class DemoFinalizeHandler:
             shot_id = data.get("shot_id")
             if not shot_id:
                 continue
+            data = dict(data)
+            # the conformed clip is the deliverable; fall back to the raw sha
+            data["asset_sha256"] = data.get("conformed_asset_id") or data.get("asset_sha256")
+            duration_ms = data.get("clip_duration_ms")
+            data["duration_s"] = (int(duration_ms) / 1000.0) if duration_ms else None
             clips[str(shot_id)] = data
         return clips
 
@@ -538,7 +372,7 @@ class DemoFinalizeHandler:
                 "clips": [
                     {
                         "shot_id": s.id,
-                        "sha256": (clip_map.get(s.id) or {}).get("asset_sha256s", [None])[0],
+                        "sha256": (clip_map.get(s.id) or {}).get("asset_sha256"),
                     }
                     for s in shots
                 ],
@@ -562,7 +396,7 @@ class DemoFinalizeHandler:
         missing = [s.shot_no for s in shots if s.id not in clip_map]
         if missing:
             raise PermanentProviderError(
-                f"clips missing for shot(s) {missing}; run demo_clips first"
+                f"clips missing for shot(s) {missing}; run s10_clips first"
             )
         narration = ctx.repos.content.narration_lines(deliverable.id)
         manifest = {
@@ -579,7 +413,7 @@ class DemoFinalizeHandler:
                     "shot_no": s.shot_no,
                     "shot_id": s.id,
                     "duration_s": clip_map[s.id].get("duration_s"),
-                    "asset_sha256": clip_map[s.id]["asset_sha256s"][0],
+                    "asset_sha256": clip_map[s.id]["asset_sha256"],
                 }
                 for s in shots
             ],
@@ -638,9 +472,17 @@ def demo_specs() -> list[StageSpec]:
             gate_after=None,
         ),
         StageSpec(
-            name="s5a_tts_preflight",
+            name="s4p_media_preflight",
             scope=Scope.EPISODE,
             depends_on=("demo_script",),
+            handler=MediaPreflightHandler(),
+            gate_after=None,
+            spends_money=False,
+        ),
+        StageSpec(
+            name="s5a_tts_preflight",
+            scope=Scope.EPISODE,
+            depends_on=("s4p_media_preflight",),
             handler=TtsPreflightHandler(),
             gate_after=None,
         ),
@@ -673,23 +515,41 @@ def demo_specs() -> list[StageSpec]:
             gate_after=None,
         ),
         StageSpec(
-            name="demo_keyframes",
-            scope=Scope.SHOT,
-            depends_on=("demo_script",),
-            handler=DemoKeyframesHandler(),
-            gate_after=GateKind.G2_KEYFRAMES,
+            name="s8a_character_sheets",
+            scope=Scope.SERIES,
+            depends_on=("s7b_audio_mix",),
+            handler=CharacterSheetHandler(),
+            gate_after=GateKind.G0_CHARACTERS,
+            spends_money=True,
         ),
         StageSpec(
-            name="demo_clips",
+            name="s8_keyframes",
             scope=Scope.SHOT,
-            depends_on=("demo_keyframes", "s6_timing"),
-            handler=DemoClipsHandler(),
+            depends_on=("s8a_character_sheets",),
+            handler=KeyframeHandler(),
+            gate_after=GateKind.G2_KEYFRAMES,
+            spends_money=True,
+        ),
+        StageSpec(
+            name="s10p_clip_preflight",
+            scope=Scope.EPISODE,
+            depends_on=("s8_keyframes",),
+            handler=ClipPreflightHandler(),
             gate_after=None,
+            spends_money=False,
+        ),
+        StageSpec(
+            name="s10_clips",
+            scope=Scope.SHOT,
+            depends_on=("s10p_clip_preflight",),
+            handler=ClipGenHandler(),
+            gate_after=None,
+            spends_money=True,
         ),
         StageSpec(
             name="demo_finalize",
             scope=Scope.DELIVERABLE,
-            depends_on=("demo_clips",),
+            depends_on=("s10_clips",),
             handler=DemoFinalizeHandler(),
             gate_after=GateKind.G3_FINAL_CUT,
         ),

@@ -55,7 +55,28 @@ class PerSecond(BaseModel):
     usd: Decimal = Field(ge=0)
 
 
-Pricing = Annotated[Per1mTokens | Per1kChars | PerImage | PerSecond, Field(discriminator="unit")]
+class PerMegapixel(BaseModel):
+    """Phase 4 additive unit: price per requested megapixel of one image."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    unit: Literal["per_megapixel"]
+    usd: Decimal = Field(ge=0)
+
+
+class PerVideo(BaseModel):
+    """Phase 4 additive unit: flat price per submitted video job."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    unit: Literal["per_video"]
+    usd: Decimal = Field(ge=0)
+
+
+Pricing = Annotated[
+    Per1mTokens | Per1kChars | PerImage | PerSecond | PerMegapixel | PerVideo,
+    Field(discriminator="unit"),
+]
 
 
 class ProviderLimit(BaseModel):
@@ -71,6 +92,30 @@ class TtsParams(BaseModel):
     output_format: str = "mp3_44100_128"
     supports_context: bool = False
     supports_language_code: bool = False
+
+
+class MediaSpec(BaseModel):
+    """Registry-driven wire contract for one fal image/video endpoint (§E1).
+
+    Every value is intentionally unverified until the operator confirms the
+    endpoint on fal.ai. Price-affecting parameters live in ``fixed_params``
+    and may never be overridden by a request.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    supported_aspects: list[str] = []
+    aspect_values: dict[str, str] = {}
+    aspect_extra_params: dict[str, dict[str, Any]] = {}
+    supported_durations_s: list[int] = []
+    max_refs: int = Field(default=0, ge=0)
+    ref_style: Literal["list", "single"] = "list"
+    param_map: dict[str, str] = {}
+    param_formats: dict[str, Literal["int", "str", "str_s"]] = {}
+    fixed_params: dict[str, Any] = {}
+    result_map: dict[str, str] = {}
+    input_transport: Literal["data_uri", "upload"] = "data_uri"
+    prompt_templates: dict[str, str] = {}
 
 
 class ModelEntry(BaseModel):
@@ -94,6 +139,9 @@ class ModelEntry(BaseModel):
     # Phase 3: optional TTS-specific knobs (kept extra="forbid" elsewhere).
     tts_params: TtsParams | None = None
     limits: ProviderLimit | None = None
+    # Phase 4: registry-driven media wire contract + ref capability.
+    media: MediaSpec | None = None
+    supports_refs: bool | None = None
 
     @property
     def model_ref(self) -> str:
@@ -125,6 +173,12 @@ ROLE_CAPABILITY: dict[str, str] = {
     "tts": "tts",
     "keyframe": "image_reference_generate",
     "video": "image_to_video",
+    # Phase 4 additive roles. Shipped profiles do not declare them (see the
+    # Discovery Report §Contradictions 2); media/registry.py falls back to the
+    # two existing roles so no Phase 1-3 snapshot contract changes.
+    "image_t2i": "image_reference_generate",
+    "image_ref": "image_reference_generate",
+    "video_i2v": "image_to_video",
 }
 
 

@@ -10,7 +10,15 @@ from __future__ import annotations
 import math
 from decimal import Decimal
 
-from studio.config.registry import ModelEntry, Per1kChars, Per1mTokens, PerImage, PerSecond
+from studio.config.registry import (
+    ModelEntry,
+    Per1kChars,
+    Per1mTokens,
+    PerImage,
+    PerMegapixel,
+    PerSecond,
+    PerVideo,
+)
 from studio.domain.errors import StudioError
 from studio.domain.money import usd_to_musd
 from studio.providers.base import LLMRequest, LLMResult, MediaRequest, TTSRequest, TTSResult
@@ -62,6 +70,19 @@ def estimate_cost_musd(
             raise StudioError("per_second pricing requires duration_s on the media request")
         usd = Decimal(str(req.duration_s)) * pricing.usd
         return usd_to_musd(usd)
+    if isinstance(pricing, PerMegapixel):
+        if not isinstance(req, MediaRequest):
+            raise StudioError(
+                f"per_megapixel pricing requires a media request, got {type(req).__name__}"
+            )
+        usd = _megapixels(req) * pricing.usd
+        return usd_to_musd(usd)
+    if isinstance(pricing, PerVideo):
+        if not isinstance(req, MediaRequest):
+            raise StudioError(
+                f"per_video pricing requires a media request, got {type(req).__name__}"
+            )
+        return usd_to_musd(pricing.usd)
     raise StudioError(f"unsupported pricing unit: {pricing.unit!r}")
 
 
@@ -87,6 +108,24 @@ def actual_cost_musd(
             return usd_to_musd(usd)
     # image/video providers report no usage in Phase 1 → estimate stands.
     return estimate_cost_musd(entry, req, tokens_per_char_worst_case=tokens_per_char_worst_case)
+
+
+def _megapixels(req: MediaRequest) -> Decimal:
+    """Requested pixel area in megapixels (worst case, never rounded down)."""
+    raw_w = req.params.get("width")
+    raw_h = req.params.get("height")
+    if raw_w is None or raw_h is None:
+        raise StudioError(
+            "per_megapixel pricing requires params.width and params.height "
+            "(the media adapter pins them from aspect_extra_params/fixed_params)"
+        )
+    try:
+        width, height = int(raw_w), int(raw_h)
+    except (TypeError, ValueError) as exc:
+        raise StudioError(f"invalid pixel dimensions: {raw_w!r} x {raw_h!r}") from exc
+    if width <= 0 or height <= 0:
+        raise StudioError(f"invalid pixel dimensions: {width} x {height}")
+    return (Decimal(width) * Decimal(height)) / _MILLION
 
 
 def _n_images(req: MediaRequest) -> int:

@@ -11,7 +11,7 @@ import subprocess
 import sys
 from collections.abc import Coroutine
 from pathlib import Path
-from typing import Any, NoReturn, TypeVar
+from typing import Annotated, Any, NoReturn, TypeVar
 
 import typer
 from rich.console import Console
@@ -24,7 +24,7 @@ from studio.core.ids import UlidIds
 from studio.db import build_repos, migrate
 from studio.db.connection import Database
 from studio.db.repos import StudioRepos
-from studio.domain.enums import BudgetScope, Language, Profile
+from studio.domain.enums import BudgetScope, Language, Profile, RunStatus
 from studio.domain.errors import RegistryError, StudioError
 from studio.domain.money import musd_to_usd, usd_to_musd
 from studio.pipeline.dag import Dag
@@ -286,6 +286,123 @@ def _phase3_doctor_rows() -> list[tuple[str, str, str]]:
     rows.extend(_tts_registry_rows())
     return rows
 
+def _media_doctor_rows(missing_filters: list[str] | None) -> list[tuple[str, str, str]]:
+    """Phase 4 checks: FAL_KEY, media registry confirmation/prices/commercial
+    flags, ref limits + aspects/durations, failed_job_billing, the new
+    ffmpeg filters, chain_mode, and one WARN per placeholder endpoint."""
+    rows: list[tuple[str, str, str]] = []
+    home = _home()
+    try:
+        config = load_all(home)
+    except StudioError as exc:
+        return [("studio config", "FAIL", f"load_all({home}): {exc}"[:200])]
+    settings = config.settings
+
+    # FAL_KEY presence (never the value itself)
+    if os.environ.get("FAL_KEY"):
+        rows.append(("FAL_KEY", "PASS", "set (value hidden)"))
+    else:
+        rows.append((
+            "FAL_KEY",
+            "WARN",
+            "not set — required for real image/video calls (sandbox mocks do not need it)",
+        ))
+
+    # Media registry entries: confirmed, prices verified, commercial flags.
+    media_entries = [
+        (key, entry)
+        for key, entry in sorted(config.registry.models.items())
+        if entry.capability in ("image_reference_generate", "image_to_video")
+    ]
+    for key, entry in media_entries:
+        problems: list[str] = []
+        if entry.placeholder:
+            problems.append(f"placeholder endpoint {entry.model_ref!r}")
+        if entry.needs_confirmation:
+            problems.append("needs_confirmation is true")
+        if entry.pricing_verified_on is None and not entry.simulated:
+            problems.append("price never verified")
+        if entry.is_zero_price and not entry.simulated and not entry.pricing_acknowledged_free:
+            problems.append("zero price without pricing_acknowledged_free")
+        licence = (
+            "commercial use verified"
+            if entry.commercial_use_verified
+            else "commercial use NOT verified (final blocked)"
+        )
+        verified_on = entry.pricing_verified_on
+        verified_text = verified_on.isoformat() if verified_on else "never"
+        name = f"media registry {key} (verified {verified_text})"
+        if problems:
+            rows.append((name, "WARN", "; ".join(problems) + f" · {licence}"))
+        else:
+            rows.append((name, "PASS", licence))
+    placeholder_media = [
+        (key, entry) for key, entry in media_entries if entry.placeholder
+    ]
+    if not media_entries:
+        rows.append(("media registry", "WARN", "no media entries (sandbox only?)"))
+    for key, entry in placeholder_media:
+        rows.append((
+            f"placeholder endpoint {key}",
+            "WARN",
+            f"{entry.model_ref!r} — the operator must confirm the endpoint, "
+            "pricing and commercial licence before spending",
+        ))
+
+    # max_refs / supported aspects / durations (informational).
+    for key, entry in media_entries:
+        spec = entry.media
+        if spec is None:
+            rows.append((
+                f"media spec {key}",
+                "WARN",
+                "no media wire contract — confirm it in model_registry.yaml",
+            ))
+            continue
+        aspects = ",".join(spec.supported_aspects) or "(unset)"
+        if entry.capability == "image_to_video":
+            durations = ",".join(str(d) for d in spec.supported_durations_s) or "(unset)"
+            detail = f"durations_s={durations} · aspects={aspects}"
+        else:
+            detail = f"max_refs={spec.max_refs} · aspects={aspects}"
+        rows.append((f"media spec {key}", "PASS", detail))
+
+    # failed_job_billing notice (explicitly unverified).
+    billing = settings.media.failed_job_billing
+    rows.append((
+        "media.failed_job_billing",
+        "WARN",
+        f"{billing!r} — unverified how fal bills failed/flagged jobs; "
+        "'charge' reserves worst case (conservative), 'free' releases on failure",
+    ))
+
+    # The new visual ffmpeg filters used by the media/QC chain.
+    visual = ("signalstats", "blackdetect", "freezedetect", "ssim", "fps", "scale",
+              "setpts", "tpad", "trim")
+    if missing_filters is None:
+        rows.append(("ffmpeg visual filters", "WARN", "capability probe did not run"))
+    else:
+        missing_visual = [name for name in visual if name in missing_filters]
+        if missing_visual:
+            rows.append(("ffmpeg visual filters", "FAIL",
+                         "missing: " + ", ".join(missing_visual)))
+        else:
+            rows.append(("ffmpeg visual filters", "PASS",
+                         ", ".join(visual)))
+
+    # chain_mode must stay "off" until Phase 5.
+    chain_mode = settings.media.chain_mode
+    if chain_mode == "off":
+        rows.append(("media.chain_mode", "PASS", "'off' (Phase 5 owns chaining)"))
+    else:
+        rows.append((
+            "media.chain_mode",
+            "FAIL",
+            f"{chain_mode!r} — only 'off' is supported before Phase 5",
+        ))
+    return rows
+
+
 def _llm_registry_rows() -> list[tuple[str, str, str]]:
     """Phase 2 rows: both LLM entries must be verified (dates shown)."""
     from studio.config.registry import Per1mTokens
@@ -412,12 +529,13 @@ def doctor(
         except Exception:
             return None
 
+    missing: list[str] | None = None
     ffmpeg = _which("ffmpeg")
     checks.append(("ffmpeg on PATH", "PASS" if ffmpeg else "FAIL", ffmpeg or "not found"))
     ffprobe = _which("ffprobe")
     checks.append(("ffprobe on PATH", "PASS" if ffprobe else "FAIL", ffprobe or "not found"))
 
-    # D3: version >= 5.0 + the exact audio filter set Phase 3 relies on.
+    # D3/H3: version >= 5.0 + the exact audio and visual filter sets.
     # Uses the same helper as tests/test_ffmpeg_capabilities.py.
     try:
         from studio.video.ffmpeg import REQUIRED_FILTERS, capability_check
@@ -449,9 +567,17 @@ def doctor(
     except Exception as exc:
         checks.append(("ffmpeg capability check", "FAIL", str(exc)[:200]))
 
+    # Phase 4: carry the visual-filter result forward for the media rows.
+    missing_filters = missing
+
     # Phase 3: ffmpeg filtergraph option, fps, library, TTS registry, voices,
     # ELEVENLABS_API_KEY, tts.keep_diacritics.
     checks.extend(_phase3_doctor_rows())
+
+    # Phase 4: FAL_KEY, media registry confirmation/prices/commercial flags,
+    # ref limits + aspects/durations, failed_job_billing, visual filters,
+    # chain_mode, placeholder endpoints.
+    checks.extend(_media_doctor_rows(missing_filters))
 
     # Phase 2: both LLM registry entries must be verified (dates shown).
     checks.extend(_llm_registry_rows())
@@ -774,8 +900,9 @@ def _run_production(
     console.print(f"deliverables: {len(seeded.deliverable_ids)}")
     console.print(f"director:     sha256 {director_sha[:16]}")
     console.print(
-        "[yellow]media stages are SKIPPED: TTS/image/video are not yet verified in "
-        "model_registry.yaml (Phase 4). The run executes S1-S4 only and parks at G1.[/yellow]"
+        "[yellow]media stages require confirmed fal endpoints and verified prices: "
+        "the production DAG executes S1-S4, then the free s4p preflight fails "
+        "closed until model_registry.yaml is confirmed (Phase 4).[/yellow]"
     )
     console.print("drive it:     studio worker --until-idle --production")
     console.print("approve G1:   studio gates approve <gate-id>   (then re-run the worker)")
@@ -786,7 +913,7 @@ def worker(
     until_idle: bool = typer.Option(False, "--until-idle", help="Stop when the queue is drained."),
     max_jobs: int | None = typer.Option(None, "--max-jobs", help="Execute at most N jobs."),
     production: bool = typer.Option(
-        False, "--production", help="Drive the LLM-only text pipeline (S1-S4)."
+        False, "--production", help="Drive the production DAG (S1-S4 + audio/media)."
     ),
 ) -> None:
     """Run the worker loop."""
@@ -795,7 +922,7 @@ def worker(
     dag = Dag(_pipeline_specs(production))
     engine = Engine(
         db=db, repos=repos, dag=dag, clock=clock, config=config, ids=ids,
-        llm_subset_only=production,
+        llm_subset_only=False,
     )
     instance = Worker(db, engine, repos, config, clock)
 
@@ -807,7 +934,7 @@ def worker(
 def resume(
     run_id: str = typer.Argument(...),
     production: bool = typer.Option(
-        False, "--production", help="Resume a text-pipeline (S1-S4) run."
+        False, "--production", help="Resume a production-DAG run."
     ),
 ) -> None:
     """Resume a halted_budget or failed run."""
@@ -815,7 +942,7 @@ def resume(
     dag = Dag(_pipeline_specs(production))
     engine = Engine(
         db=db, repos=repos, dag=dag, clock=clock, config=config, ids=ids,
-        llm_subset_only=production,
+        llm_subset_only=False,
     )
     try:
         engine.resume_run(run_id)
@@ -1163,9 +1290,9 @@ _TEXT_STAGES = frozenset({"bible_upsert", "narration_script", "shot_plan", "meta
 
 def _pipeline_specs(production: bool) -> list[StageSpec]:
     if production:
-        from studio.pipeline.stages_text import text_specs
+        from studio.pipeline.specs import production_specs
 
-        return text_specs()
+        return production_specs()
     return _demo_specs_light()
 
 
@@ -1176,9 +1303,9 @@ def _dag_for_run(repos: StudioRepos, run_id: str) -> Dag:
     except Exception:  # diagnostics only; never block the operator
         rows = []
     if any(row.stage in _TEXT_STAGES for row in rows):
-        from studio.pipeline.stages_text import text_specs
+        from studio.pipeline.specs import production_specs
 
-        return Dag(text_specs())
+        return Dag(production_specs())
     return Dag(_demo_specs_light())
 
 
@@ -1202,9 +1329,9 @@ def _dag_for_pending(repos: StudioRepos, run_id: str | None) -> Dag:
     except Exception:
         pending = []
     if any(gate.stage in _TEXT_STAGES for gate in pending):
-        from studio.pipeline.stages_text import text_specs
+        from studio.pipeline.specs import production_specs
 
-        return Dag(text_specs())
+        return Dag(production_specs())
     return Dag(_demo_specs_light())
 
 
@@ -1701,6 +1828,1386 @@ def audio_calibrate(
     console.print(f"  words_per_second: {{{suggested_text}}}")
     console.print("(calibrate never writes config)")
 
+
+
+# ==================================================================
+# shot / media (Phase 4, §N)
+# ==================================================================
+# ==================================================================
+# shot / media (Phase 4, §N)
+# ==================================================================
+
+shot_app = typer.Typer(help="Shot inspection and regeneration (Phase 4).")
+media_app = typer.Typer(help="Media outputs: preview, QC, audition, smoke (Phase 4).")
+app.add_typer(shot_app, name="shot")
+app.add_typer(media_app, name="media")
+
+_SHOT_MEDIA_STAGES = {"keyframe": "s8_keyframes", "clip": "s10_clips"}
+
+
+@shot_app.command("list")
+def shot_list(run_id: str = typer.Argument(..., help="Run id.")) -> None:
+    """Per shot: attempt history, QC status/warnings, sanitize level, cost."""
+    _, db, _clock, _ids, repos = _connect()
+    run = repos.pipeline.get_run(run_id)
+    if run is None:
+        _fail(f"unknown run {run_id}")
+    episode_id = run.episode_id
+    if not episode_id:
+        _fail(f"run {run_id} has no episode")
+    tracks = {track.id: track for track in repos.content.list_tracks(episode_id)}
+    table = Table(title=f"shots — run {run_id}")
+    for column in (
+        "shot", "aspect", "kind", "attempt", "qc", "sanitize", "cost_usd", "qc_warns", "prompt",
+    ):
+        table.add_column(column)
+    rows = db.connect().execute(
+        "SELECT shot_id, kind, attempt_no, qc_status, sanitize_level, cost_musd, qc_json "
+        "FROM shot_attempts ORDER BY shot_id, kind, attempt_no"
+    ).fetchall()
+    attempts_by_shot: dict[str, list[Any]] = {}
+    for row in rows:
+        attempts_by_shot.setdefault(str(row["shot_id"]), []).append(row)
+    shots = sorted(
+        repos.content.list_shots(episode_id), key=lambda shot: (shot.track_id, shot.shot_no)
+    )
+    for shot in shots:
+        track = tracks.get(shot.track_id)
+        aspect = track.aspect if track is not None else "?"
+        attempts = attempts_by_shot.get(shot.id, [])
+        if not attempts:
+            table.add_row(
+                str(shot.shot_no), aspect, "-", "-", "-", "-", "-", "-", _truncate(shot.prompt, 40)
+            )
+            continue
+        for attempt in attempts:
+            try:
+                qc = json.loads(attempt["qc_json"] or "[]")
+            except json.JSONDecodeError:
+                qc = []
+            warns = sum(
+                1 for check in qc if isinstance(check, dict) and check.get("status") == "warn"
+            )
+            table.add_row(
+                str(shot.shot_no),
+                aspect,
+                str(attempt["kind"]),
+                str(attempt["attempt_no"]),
+                str(attempt["qc_status"]),
+                str(attempt["sanitize_level"]),
+                f"{musd_to_usd(int(attempt['cost_musd'])):.4f}",
+                str(warns),
+                _truncate(shot.prompt, 40),
+            )
+    console.print(table)
+
+
+def _aspect_of(value: str) -> Any:
+    from studio.domain.enums import Aspect
+
+    try:
+        return Aspect(value)
+    except ValueError as exc:
+        raise StudioError(f"unknown aspect {value!r}") from exc
+
+
+def _worst_case_reserve(
+    entry: Any, *, kind: str, aspect: Any, clip_duration_ms: int | None
+) -> int | None:
+    from decimal import Decimal
+
+    from studio.config.registry import PerImage, PerMegapixel, PerSecond, PerVideo
+    from studio.media.stages import _pixel_dims_for
+
+    pricing = entry.pricing
+    if kind == "keyframe":
+        if isinstance(pricing, PerImage):
+            return usd_to_musd(pricing.usd)
+        if isinstance(pricing, PerVideo):
+            return usd_to_musd(pricing.usd)
+        if isinstance(pricing, PerMegapixel):
+            dims = _pixel_dims_for(entry, aspect)
+            if dims is None:
+                return None
+            width, height = dims
+            return usd_to_musd(
+                (Decimal(width) * Decimal(height) / Decimal(1_000_000)) * pricing.usd
+            )
+        return None
+    locked_ms = int(clip_duration_ms or 5000)
+    if isinstance(pricing, PerSecond):
+        return usd_to_musd(Decimal(locked_ms) / Decimal(1000) * pricing.usd)
+    if isinstance(pricing, PerVideo):
+        return usd_to_musd(Decimal(1) * pricing.usd)
+    return None
+
+
+def _truncate(text: str, width: int) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
+@shot_app.command("regenerate")
+def shot_regenerate(
+    run_id: str = typer.Argument(..., help="Run id."),
+    shot_id: str = typer.Argument(..., help="Shot id."),
+    stage: str = typer.Option(..., "--stage", help="keyframe | clip"),
+    prompt_file: str | None = typer.Option(
+        None, "--prompt-file", help="UTF-8 file with the edited prompt for the shot."
+    ),
+    reason: str | None = typer.Option(None, "--reason", help="Operator note for the audit log."),
+    yes: bool = typer.Option(False, "--yes", help="Proceed (required to spend)."),
+) -> None:
+    """Regenerate one shot's keyframe or clip.
+
+    Creates a fresh attempt with a new nonce (resetting the nonce-based
+    regeneration counter), stales only that shot's keyframe/clip stage rows
+    and their downstream dependents (never purging stored raw assets), shows
+    the worst-case reserve cost first, and refuses without --yes. A
+    completed/failed/halted run is reopened (same semantics as `gates
+    request-changes`); the rest of the run stays as it was.
+    """
+    from studio.db.repos.pipeline import subject_from_stage_run
+    from studio.domain.refs import subjects_related
+    from studio.media.registry import MediaRole, media_model_entry, model_confirmation_problems
+    from studio.pipeline.gates import build_shot_anchor
+
+    stage = stage.strip().lower()
+    if stage not in _SHOT_MEDIA_STAGES:
+        _fail(f"--stage must be one of {sorted(_SHOT_MEDIA_STAGES)}")
+    kind = "keyframe" if stage == "keyframe" else "clip"
+
+    config, _db, _clock, ids, repos = _connect()
+    run = repos.pipeline.get_run(run_id)
+    if run is None:
+        _fail(f"unknown run {run_id}")
+    reopen_from: str | None = None
+    if run.status in (
+        RunStatus.COMPLETED.value,
+        RunStatus.FAILED.value,
+        RunStatus.HALTED_BUDGET.value,
+    ):
+        reopen_from = run.status
+    shot = repos.content.get_shot(shot_id)
+    if shot is None:
+        _fail(f"unknown shot {shot_id}")
+    track = repos.content.get_track(shot.track_id)
+    if track is None:
+        _fail(f"shot {shot_id} references missing track {shot.track_id}")
+    episode = repos.content.get_episode(track.episode_id)
+    assert episode is not None
+    if run.episode_id != episode.id:
+        _fail(f"shot {shot_id} does not belong to run {run_id}'s episode")
+
+    prompt_edit: str | None = None
+    if prompt_file is not None:
+        prompt_path = Path(prompt_file)
+        if not prompt_path.is_file():
+            _fail(f"prompt file not found: {prompt_path}")
+        try:
+            prompt_edit = prompt_path.read_bytes().decode("utf-8").strip()
+        except UnicodeDecodeError:
+            _fail(f"{prompt_path} is not UTF-8")
+        if not prompt_edit:
+            _fail(f"{prompt_path} contains no non-empty prompt")
+
+    # Resolve the model + worst-case reserve cost before any spend.
+    resolved_profile = config.registry.resolve_profile(run.profile)
+    role: MediaRole = "keyframes" if kind == "keyframe" else "clips"
+    try:
+        model_key, entry = media_model_entry(config, resolved_profile, role)
+    except StudioError as exc:
+        _fail(str(exc))
+    aspect_enum = _aspect_of(track.aspect)
+    try:
+        reserve_musd: int | None = _worst_case_reserve(
+            entry, kind=kind, aspect=aspect_enum, clip_duration_ms=shot.clip_duration_ms
+        )
+    except StudioError as exc:
+        _fail(f"cannot estimate reserve cost for {model_key!r}: {exc}")
+    if reserve_musd is None:
+        reserve_musd = 0
+        console.print(
+            "[yellow]worst case not computable offline for this model (unconfirmed "
+            "price/dims); reserving nothing — the gateway still enforces the cap[/yellow]"
+        )
+    console.print(f"model: {model_key} ({entry.provider})")
+    console.print(f"worst-case reserve for one {kind}: ${musd_to_usd(reserve_musd):.4f}")
+    problems = model_confirmation_problems(entry, final=Profile(run.profile) is Profile.FINAL)
+    if problems:
+        listing = "; ".join(problems)
+        console.print(
+            f"[yellow]warning: model entry is not trusted with money: {listing} — "
+            f"the paid stages will refuse this model until the operator attests it[/yellow]"
+        )
+
+    if not yes:
+        _fail("aborted (nothing spent) — re-run with --yes to proceed")
+
+    anchor = build_shot_anchor(repos, shot.id)
+    current_attempt = repos.content.current_shot_attempt(shot.id, kind=kind)
+    base_prompt = current_attempt.prompt_used if current_attempt is not None else shot.prompt
+    new_prompt = prompt_edit if prompt_edit is not None else base_prompt
+
+    attempt_no = repos.content.next_shot_attempt_no(shot.id)
+    attempt = repos.content.create_shot_attempt(
+        shot_id=shot.id,
+        attempt_no=attempt_no,
+        nonce=ids.new(),
+        prompt_used=new_prompt,
+        kind=kind,
+    )
+
+    dag = _dag_for_run(repos, run_id)
+    seeds = {_SHOT_MEDIA_STAGES[kind]}
+    stages_to_stale = set(seeds)
+    for seed in seeds:
+        stages_to_stale |= dag.downstream(seed)
+    affected = [
+        row.id
+        for row in repos.pipeline.list_stage_runs(run_id)
+        if row.stage in stages_to_stale
+        and row.status in ("succeeded", "pending", "running", "stale")
+        and subjects_related(anchor, subject_from_stage_run(row))
+    ]
+    if affected:
+        repos.pipeline.mark_stale(affected)
+
+    if reopen_from is not None:
+        repos.pipeline.set_run_status(run_id, RunStatus.RUNNING.value)
+        assert episode is not None
+        repos.content.set_episode_status(episode.id, RunStatus.RUNNING.value)
+
+    payload: dict[str, Any] = {
+        "run_id": run_id,
+        "shot_id": shot.id,
+        "track_id": track.id,
+        "stage": kind,
+        "attempt_id": attempt.id,
+        "attempt_no": attempt_no,
+        "model_key": model_key,
+        "reserve_cost_musd": reserve_musd,
+        "reason": reason,
+        "prompt_edited": prompt_edit is not None,
+        "staled_stage_runs": sorted(affected),
+        "per_round_counters_reset": True,
+        "reopened_from_status": reopen_from,
+    }
+    if prompt_edit is not None:
+        payload["prompt_sha256_old"] = hashlib.sha256(base_prompt.encode("utf-8")).hexdigest()
+        payload["prompt_sha256_new"] = hashlib.sha256(new_prompt.encode("utf-8")).hexdigest()
+    repos.audit.append(
+        actor="operator",
+        entity=f"shot:{shot.id}",
+        event="shot_regenerate_requested",
+        payload=payload,
+    )
+    repos.jobs.enqueue(
+        kind="advance_run",
+        payload={"run_id": run_id},
+        dedupe_key=f"advance:{run_id}",
+    )
+    console.print(
+        f"shot {shot_id} {kind} regenerate: attempt {attempt_no} created "
+        f"({len(affected)} stage run(s) staled)"
+    )
+    console.print("run `studio worker --until-idle` to regenerate")
+
+
+def _cas(config: AppConfig, db: Database, clock: SystemClock) -> Any:
+    from studio.core.cas import ContentStore
+
+    return ContentStore(Path(config.settings.paths.cas), db, clock)
+
+
+def _escape(value: Any) -> str:
+    import html
+
+    return html.escape(str(value), quote=True)
+
+
+def _copy_for_preview(outdir: Path, cas, sha: str | None) -> str | None:  # type: ignore[no-untyped-def]
+    """Copy a CAS asset into <outdir>/assets/ and return the relative POSIX link."""
+    if not sha:
+        return None
+    import shutil
+
+    try:
+        source = cas.resolve(sha)
+    except Exception:
+        return None
+    assets_dir = outdir / "assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    suffix = source.suffix or ".bin"
+    target = assets_dir / f"{sha[:16]}{suffix}"
+    if not target.exists():
+        shutil.copy2(source, target)
+    return target.relative_to(outdir).as_posix()
+
+
+_QC_STYLE = {"pass": "#2e7d32", "warn": "#b45309", "fail": "#b91c1c"}
+
+
+def _render_qc_rows(qc: list[dict[str, Any]]) -> str:
+    if not qc:
+        return '<p class="muted">no QC recorded</p>'
+    rows = []
+    for check in qc:
+        if not isinstance(check, dict):
+            continue
+        name = _escape(check.get("name", "?"))
+        status = _escape(check.get("status", "?"))
+        value = _escape(check.get("value"))
+        threshold = _escape(check.get("threshold"))
+        color = _QC_STYLE.get(str(check.get("status")), "#555")
+        rows.append(
+            f'<tr><td>{name}</td>'
+            f'<td style="color:{color};font-weight:600">{status}</td>'
+            f"<td>{value}</td><td>{threshold}</td></tr>"
+        )
+    return (
+        '<table class="qc"><thead><tr><th>check</th><th>status</th>'
+        "<th>value</th><th>threshold</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
+    )
+
+
+def _preview_page(title: str, body: str) -> str:
+    return f"""<!doctype html>
+<html lang="ar" dir="auto">
+<head>
+<meta charset="utf-8">
+<title>{_escape(title)}</title>
+<style>
+body {{ font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; margin: 2rem; }}
+h1, h2 {{ color: #f8fafc; }}
+.card {{ background: #1e293b; border-radius: 12px; padding: 1rem 1.25rem; margin: 1rem 0; }}
+.card img, .card video {{ max-width: 320px; border-radius: 8px; border: 1px solid #334155; }}
+table {{ border-collapse: collapse; margin: 0.5rem 0; }}
+td, th {{ border: 1px solid #334155; padding: 0.25rem 0.6rem; font-size: 0.85rem; }}
+.muted {{ color: #94a3b8; }}
+code {{ background: #0b1220; padding: 0.1rem 0.3rem; border-radius: 4px; }}
+</style>
+</head>
+<body>
+{body}
+</body>
+</html>
+"""
+
+
+@media_app.command("preview")
+def media_preview(
+    run_id: str = typer.Argument(..., help="Run id."),
+    stage: str | None = typer.Option(
+        None, "--stage", help="sheets | keyframes | clips (default: all three)"
+    ),
+) -> None:
+    """Write data/previews/<run_id>/<stage>.html (stdlib-only static page)."""
+    stages = [stage.strip().lower()] if stage else ["sheets", "keyframes", "clips"]
+    for item in stages:
+        if item not in ("sheets", "keyframes", "clips"):
+            _fail(f"--stage must be sheets|keyframes|clips, got {item!r}")
+
+    config, db, clock, _ids, repos = _connect()
+    migrate(db)
+    run = repos.pipeline.get_run(run_id)
+    if run is None:
+        _fail(f"unknown run {run_id}")
+    episode_id = run.episode_id
+    if not episode_id:
+        _fail(f"run {run_id} has no episode")
+    episode = repos.content.get_episode(episode_id)
+    assert episode is not None
+    tracks = {track.id: track for track in repos.content.list_tracks(episode_id)}
+    shots = {
+        shot.id: shot
+        for track in tracks.values()
+        for shot in repos.content.shots_for_track(track.id)
+    }
+    cas = _cas(config, db, clock)
+    outdir = Path(config.settings.paths.home) / "data" / "previews" / run_id
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    for item in stages:
+        body_parts: list[str] = [f"<h1>media preview — {_escape(item)}</h1>"]
+        body_parts.append(
+            f'<p class="muted">run <code>{_escape(run_id)}</code> · '
+            f"episode <code>{_escape(episode_id)}</code></p>"
+        )
+        sheet_events = list(
+            repos.audit.list(event="character_sheet_generated", limit=1000)
+        ) + list(repos.audit.list(event="character_sheet_attempt", limit=1000))
+        if item == "sheets":
+            body_parts.append(
+                _render_sheets(repos, sheet_events, cas, outdir, episode.series_id)
+            )
+        elif item == "keyframes":
+            body_parts.append(_render_attempts(db, cas, outdir, shots, tracks, "keyframe"))
+        else:
+            body_parts.append(_render_attempts(db, cas, outdir, shots, tracks, "clip"))
+        target = outdir / f"{item}.html"
+        target.write_text(_preview_page(f"media preview — {item}", "\n".join(body_parts)), "utf-8")
+        console.print(f"preview written to {target}")
+
+
+def _render_sheets(  # type: ignore[no-untyped-def]
+    repos, event_rows, cas, outdir: Path, series_id: str
+) -> str:
+    sheets = repos.sheets.list_for_series(series_id)
+    by_sheet: dict[str, dict[str, Any]] = {}
+    attempt_history: dict[tuple[str, str], list[str]] = {}
+    for event in event_rows:
+        try:
+            payload = json.loads(event.payload_json or "{}")
+        except json.JSONDecodeError:
+            continue
+        if event.event == "character_sheet_generated":
+            sheet_id = payload.get("sheet_id")
+            if isinstance(sheet_id, str):
+                by_sheet[sheet_id] = payload
+        elif event.event == "character_sheet_attempt":
+            key = (str(payload.get("character_id")), str(payload.get("role")))
+            cost = payload.get("cost_musd")
+            cost_text = f"${musd_to_usd(int(cost)):.4f}" if isinstance(cost, int | float) else "-"
+            history_item = (
+                f"<li>nonce <code>{_escape(str(payload.get('nonce', ''))[:12])}</code> "
+                f"· qc <strong>{_escape(payload.get('qc_status', '?'))}</strong> "
+                f"· sanitize {_escape(payload.get('sanitize_level', '-'))} "
+                f"· {cost_text}</li>"
+            )
+            attempt_history.setdefault(key, []).append(history_item)
+    if not sheets:
+        return '<p class="muted">no sheets yet (run S8a or approve G0 first)</p>'
+    parts: list[str] = []
+    for sheet in sheets:
+        payload = by_sheet.get(sheet.id, {})
+        qc_raw = payload.get("qc")
+        qc = [c for c in qc_raw if isinstance(c, dict)] if isinstance(qc_raw, list) else []
+        cost = payload.get("cost_musd")
+        cost_text = f"${musd_to_usd(int(cost)):.4f}" if isinstance(cost, int | float) else "-"
+        link = _copy_for_preview(outdir, cas, sheet.asset_id)
+        img = (
+            f'<img src="{_escape(link)}" alt="sheet {_escape(sheet.character_id)}">'
+            if link
+            else ""
+        )
+        warns = sum(
+            1 for c in qc if isinstance(c, dict) and c.get("status") == "warn"
+        )
+        history = "".join(attempt_history.get((sheet.character_id, sheet.role), []))
+        prompt_spec = payload.get("prompt_spec_json")
+        prompt_text = ""
+        if isinstance(prompt_spec, str):
+            try:
+                parsed = json.loads(prompt_spec)
+                prompt_text = str(parsed.get("scene_text") or parsed.get("full_prompt") or "")
+            except json.JSONDecodeError:
+                prompt_text = prompt_spec[:200]
+        parts.append(
+            f'<div class="card"><h2>{_escape(sheet.character_id)} · '
+            f'{_escape(sheet.role)} · v{sheet.version} '
+            f'<span class="muted">({_escape(sheet.status)})</span></h2>\n{img}\n'
+            f"<p>{_escape(prompt_text)}</p>\n"
+            f"<p>spec <code>{_escape(sheet.spec_hash[:16])}</code> · "
+            f"nonce <code>{_escape(sheet.nonce[:12])}</code> · cost {_escape(cost_text)} · "
+            f"sanitize {_escape(payload.get('sanitize_level', '-'))} · warnings {warns}</p>\n"
+            f'<p class="muted">attempt history</p><ul>{history}</ul>\n'
+            f"{_render_qc_rows(qc)}</div>"
+        )
+    return "\n".join(parts)
+
+
+def _render_attempts(  # type: ignore[no-untyped-def]
+    db, cas, outdir: Path, shots: dict[str, Any], tracks: dict[str, Any], kind: str
+) -> str:
+    rows = db.connect().execute(
+        "SELECT * FROM shot_attempts WHERE kind = ? ORDER BY shot_id, attempt_no",
+        (kind,),
+    ).fetchall()
+    parts: list[str] = []
+    by_shot: dict[str, list[Any]] = {}
+    for row in rows:
+        shot_id = str(row["shot_id"])
+        if shot_id not in shots:
+            continue
+        by_shot.setdefault(shot_id, []).append(row)
+    if not by_shot:
+        return f'<p class="muted">no {kind} attempts yet</p>'
+    ordered = sorted(
+        by_shot.items(),
+        key=lambda item: (
+            (shots[item[0]].track_id, shots[item[0]].shot_no)
+            if item[0] in shots
+            else ("", 0)
+        ),
+    )
+    by_shot = dict(ordered)
+    for shot_id, attempts in by_shot.items():
+        shot = shots.get(shot_id)
+        shot_no = shot.shot_no if shot is not None else "?"
+        track = tracks.get(shot.track_id) if shot is not None else None
+        aspect = track.aspect if track is not None else "?"
+        prompt = shot.prompt if shot is not None else ""
+        history: list[str] = []
+        for attempt in attempts:
+            attempt = dict(attempt)
+            try:
+                qc = json.loads(attempt["qc_json"] or "[]")
+            except json.JSONDecodeError:
+                qc = []
+            warns = sum(
+                1 for c in qc if isinstance(c, dict) and c.get("status") == "warn"
+            )
+            cost = f"${musd_to_usd(int(attempt['cost_musd'])):.4f}"
+            nonce_html = _escape(str(attempt["nonce"])[:12])
+            history.append(
+                f"<li>attempt {attempt['attempt_no']} · nonce <code>{nonce_html}</code> "
+                f"· qc <strong>{_escape(attempt['qc_status'])}</strong> "
+                f"· sanitize {attempt['sanitize_level']} "
+                f"· {cost} · warnings {warns}</li>"
+            )
+        current = attempts[-1]
+        asset_sha = current["conformed_asset_id"] or current["asset_id"]
+        try:
+            qc = json.loads(current["qc_json"] or "[]")
+        except json.JSONDecodeError:
+            qc = []
+        link = _copy_for_preview(outdir, cas, asset_sha)
+        tag = "video" if kind == "clip" else "img"
+        media = (
+            f'<{tag} src="{_escape(link)}" controls></{tag}>'
+            if tag == "video" and link
+            else (f'<{tag} src="{_escape(link)}"></{tag}>' if link else "")
+        )
+        parts.append(
+            f'<div class="card"><h2>shot {shot_no} · {_escape(aspect)}</h2>\n'
+            f"<p>{_escape(prompt)}</p>\n{media}\n"
+            f'<p class="muted">attempt history</p><ul>{"".join(history)}</ul>\n'
+            f"{_render_qc_rows(qc)}</div>"
+        )
+    return "\n".join(parts)
+
+
+
+@media_app.command("qc")
+def media_qc(
+    reference: str = typer.Argument(..., help="Attempt id, asset sha, or file path."),
+    aspect: str = typer.Option("9:16", "--aspect", help="Aspect to check (default 9:16)."),
+    kind: str | None = typer.Option(
+        None, "--kind", help="image | video (aliases: keyframe | clip; default: infer)"
+    ),
+    expected_frames: int | None = typer.Option(None, "--expected-frames"),
+    keyframe: str | None = typer.Option(None, "--keyframe", help="Keyframe path for SSIM (clips)."),
+) -> None:
+    """Run the visual QC on an asset/attempt and print each check."""
+    from pathlib import Path as _Path
+
+    from studio.qc.visual import qc_image, qc_summary, qc_video
+
+    config, db, clock, ids, repos = _connect()
+    migrate(db)
+    _ = ids
+
+    path: Path | None = None
+    resolved_kind = kind
+    resolved_aspect = aspect
+    resolved_frames = expected_frames
+    resolved_keyframe = Path(keyframe) if keyframe else None
+
+    candidate = _Path(reference)
+    if candidate.is_file():
+        path = candidate
+        if resolved_kind is None:
+            resolved_kind = "image" if candidate.suffix.lower() in {
+                ".png", ".jpg", ".jpeg", ".webp", ".bmp"
+            } else "video"
+    else:
+        attempt = repos.content.get_shot_attempt(reference)
+        if attempt is not None:
+            resolved_kind = resolved_kind or attempt.kind
+            sha = attempt.conformed_asset_id or attempt.asset_id
+            if sha is None:
+                _fail(f"attempt {reference} has no stored asset yet")
+            cas = _cas(config, db, clock)
+            path = cas.resolve(sha)
+            shot = repos.content.get_shot(attempt.shot_id)
+            if shot is not None:
+                track = repos.content.get_track(shot.track_id)
+                if track is not None:
+                    resolved_aspect = track.aspect
+        else:
+            asset = repos.assets.get(reference)
+            if asset is not None:
+                cas = _cas(config, db, clock)
+                path = cas.resolve(asset.sha256)
+                if resolved_kind is None:
+                    resolved_kind = "image" if (asset.kind or "") == "image" else "video"
+            else:
+                _fail(f"not a file, attempt id, or asset sha: {reference!r}")
+
+    assert path is not None
+    resolved_kind = _qc_kind(resolved_kind)
+    if resolved_kind is None:
+        _fail(f"could not infer media kind for {reference!r}; pass --kind image|video")
+
+    attempt_row = (
+        repos.content.get_shot_attempt(reference)
+        if not Path(reference).is_file()
+        else None
+    )
+    if resolved_kind == "image":
+        checks = _run_async(
+            qc_image(path, aspect=resolved_aspect, settings=config.settings)
+        )
+    else:
+        if resolved_frames is None and attempt_row is not None:
+            from studio.media.conform import clip_frames_for
+
+            shot = repos.content.get_shot(attempt_row.shot_id)
+            locked = getattr(shot, "clip_duration_ms", None) if shot is not None else None
+            if locked:
+                resolved_frames = clip_frames_for(int(locked), int(config.settings.render.fps))
+        checks = _run_async(
+            qc_video(
+                path,
+                aspect=resolved_aspect,
+                settings=config.settings,
+                keyframe_path=resolved_keyframe,
+                expected_frames=resolved_frames,
+            )
+        )
+    table = Table(title=f"visual QC — {path.name}")
+    for column in ("check", "status", "value", "threshold", "retryable"):
+        table.add_column(column)
+    for check in checks:
+        style = {"pass": "green", "warn": "yellow", "fail": "red"}.get(check.status, "white")
+        table.add_row(
+            check.name,
+            f"[{style}]{check.status}[/{style}]",
+            str(check.value),
+            str(check.threshold),
+            "yes" if check.retryable else "no",
+        )
+    console.print(table)
+    summary = qc_summary(checks)
+    n_fail = sum(1 for c in checks if c.status == "fail")
+    n_warn = sum(1 for c in checks if c.status == "warn")
+    console.print(f"overall: {summary['status']} ({n_fail} fail(s), {n_warn} warning(s))")
+    if any(check.status == "fail" for check in checks):
+        raise typer.Exit(code=1)
+
+
+
+_QC_KIND_ALIASES = {"keyframe": "image", "image": "image", "clip": "video", "video": "video"}
+
+
+def _qc_kind(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return _QC_KIND_ALIASES.get(value.strip().lower())
+
+
+def _audition_entries(config: AppConfig, keys: list[str], capability: str) -> list[tuple[str, Any]]:
+    entries: list[tuple[str, Any]] = []
+    for key in keys:
+        entry = config.registry.models.get(key)
+        if entry is None:
+            _fail(f"unknown model_key {key!r} in model_registry.yaml")
+        if entry.capability != capability:
+            _fail(f"{key!r} has capability {entry.capability!r}, expected {capability!r}")
+        entries.append((key, entry))
+    return entries
+
+
+def _audition_estimate(
+    entry: Any,
+    *,
+    kind: str,
+    aspect: Any,
+    duration_s: float | None,
+    refs: list[Path],
+) -> int:
+    """Worst-case per-call cost in micro-USD; refuses when not computable."""
+    from decimal import Decimal
+
+    from studio.config.registry import PerImage, PerMegapixel, PerSecond, PerVideo
+    from studio.media.stages import _pixel_dims_for
+
+    pricing = entry.pricing
+    if kind == "image":
+        if isinstance(pricing, PerImage):
+            return usd_to_musd(pricing.usd)
+        if isinstance(pricing, PerVideo):
+            return usd_to_musd(pricing.usd)
+        if isinstance(pricing, PerMegapixel):
+            dims = _pixel_dims_for(entry, aspect)
+            if dims is None:
+                raise StudioError(
+                    f"per_megapixel entry {entry.model_ref!r} has no confirmed "
+                    f"width/height for aspect {aspect.value}"
+                )
+            width, height = dims
+            return usd_to_musd(
+                (Decimal(width) * Decimal(height) / Decimal(1_000_000)) * pricing.usd
+            )
+        raise StudioError(f"unsupported pricing unit {pricing.unit!r} for an image model")
+    assert duration_s is not None
+    if isinstance(pricing, PerSecond):
+        return usd_to_musd(Decimal(str(duration_s)) * pricing.usd)
+    if isinstance(pricing, PerVideo):
+        return usd_to_musd(pricing.usd)
+    raise StudioError(f"unsupported pricing unit {pricing.unit!r} for a video model")
+
+
+def _store_reference(cas: Any, path: Path) -> Any:
+    suffix = path.suffix.lower().lstrip(".") or "bin"
+    return cas.put_file(path, kind="image", ext=suffix, retention="intermediate", move=False)
+
+
+@media_app.command("audition")
+def media_audition(
+    kind: str = typer.Argument(..., help="image | clip"),
+    model_keys: str = typer.Option(..., "--model-keys", help="Comma-separated registry keys."),
+    prompts_file: str | None = typer.Option(
+        None, "--prompts-file", help="UTF-8 prompts, one per line (image)."
+    ),
+    refs: Annotated[list[str] | None, typer.Option(
+        "--ref", help="Reference image paths (image audition)."
+    )] = None,
+    image: str | None = typer.Option(None, "--image", help="Source image path (clip audition)."),
+    prompt_text: str | None = typer.Option(None, "--prompt-text", help="Motion prompt (clip)."),
+    duration: float = typer.Option(5.0, "--duration", help="Clip duration in seconds (clip)."),
+    aspect: str = typer.Option("9:16", "--aspect", help="Aspect ratio."),
+    cap_usd: float = typer.Option(1.00, "--cap-usd", min=0.0, help="Hard cap on total spend."),
+    yes: bool = typer.Option(False, "--yes", help="Proceed (required to spend)."),
+) -> None:
+    """Audition image or clip models before committing a series.
+
+    episode_id is NULL on purpose (month/global budgets apply). The worst-case
+    total must fit under --cap-usd before ANY call is made; a running-total
+    guard re-checks before every subsequent call. Deterministic nonces make
+    re-running the same audition free (cache hits). Image auditions with no
+    --ref are pure text-to-image; with refs they are reference-guided.
+    """
+    import shutil
+    from datetime import UTC, datetime
+
+    from studio.core.cas import ContentStore
+    from studio.core.gateway import CallContext, ProviderGateway
+    from studio.domain.enums import Aspect
+    from studio.domain.refs import AssetRef
+    from studio.providers.base import MediaRequest
+
+    kind = kind.strip().lower()
+    if kind not in ("image", "clip"):
+        _fail("kind must be image|clip")
+    keys = [k.strip() for k in model_keys.split(",") if k.strip()]
+    if not keys:
+        _fail("--model-keys must name at least one registry key")
+    try:
+        aspect_enum = Aspect(aspect.strip())
+    except ValueError:
+        _fail(f"unknown aspect {aspect!r}")
+
+    config, db, clock, ids, repos = _connect()
+    del repos
+    migrate(db)
+
+    cap_musd = usd_to_musd(str(cap_usd))
+    plan: list[tuple[str, Any, str]] = []  # (key, entry, prompt)
+
+    ref_paths = [Path(ref) for ref in (refs or [])]
+    image_path: Path | None = None
+
+    if kind == "image":
+        if prompts_file is None:
+            _fail("--prompts-file is required for image auditions")
+        prompts_path = Path(prompts_file)
+        if not prompts_path.is_file():
+            _fail(f"prompts file not found: {prompts_path}")
+        try:
+            prompts = [
+                line.strip()
+                for line in prompts_path.read_bytes().decode("utf-8").splitlines()
+                if line.strip()
+            ]
+        except UnicodeDecodeError:
+            _fail(f"{prompts_path} is not UTF-8")
+        if not prompts:
+            _fail(f"{prompts_path} contains no non-empty prompts")
+        if image is not None:
+            _fail("--image only applies to clip auditions")
+        for ref_path in ref_paths:
+            if not ref_path.is_file():
+                _fail(f"reference image not found: {ref_path}")
+        entries = _audition_entries(config, keys, "image_reference_generate")
+        for key, entry in entries:
+            if ref_paths and entry.supports_refs is False:
+                _fail(f"{key!r} does not support reference inputs")
+            if not ref_paths and entry.supports_refs is not False:
+                pass  # pure T2I is fine even for ref-capable models
+        plan = [(key, entry, prompt) for prompt in prompts for key, entry in entries]
+    else:
+        if image is None:
+            _fail("--image is required for clip auditions")
+        if prompt_text is None or not prompt_text.strip():
+            _fail("--prompt-text is required for clip auditions")
+        if ref_paths:
+            _fail("--ref only applies to image auditions; clip auditions take --image")
+        image_path = Path(image)
+        if not image_path.is_file():
+            _fail(f"image not found: {image_path}")
+        entries = _audition_entries(config, keys, "image_to_video")
+        plan = [(key, entry, prompt_text.strip()) for key, entry in entries]
+
+    try:
+        estimates = [
+            _audition_estimate(
+                entry, kind=kind, aspect=aspect_enum,
+                duration_s=duration if kind == "clip" else None,
+                refs=ref_paths,
+            )
+            for _key, entry, _prompt in plan
+        ]
+    except StudioError as exc:
+        _fail(str(exc))
+    worst_case = sum(estimates)
+    console.print(
+        f"audition plan: {len(plan)} call(s) from {len(keys)} model(s) "
+        f"worst-case ${musd_to_usd(worst_case):.4f} total (cap ${cap_usd:.4f})"
+    )
+    for _key, entry, _prompt in plan:
+        problems = []
+        if entry.needs_confirmation:
+            problems.append("needs_confirmation")
+        if entry.pricing_verified_on is None and not entry.simulated:
+            problems.append("price never verified")
+        if problems:
+            console.print(f"[yellow]warning: {_key} is unverified ({', '.join(problems)})[/yellow]")
+    if worst_case > cap_musd:
+        _fail(
+            f"worst-case audition cost exceeds --cap-usd "
+            f"({musd_to_usd(worst_case):.4f} > {cap_usd:.4f}); raise the cap or narrow the matrix"
+        )
+    if not yes:
+        _fail("aborted (nothing spent) — re-run with --yes to proceed")
+
+    cas = ContentStore(Path(config.settings.paths.cas), db, clock)
+    gateway = ProviderGateway(
+        db=db,
+        settings=config.settings,
+        registry=config.registry,
+        cas=cas,
+        ledger=_ledger_for(db, config, clock, ids),
+        clock=clock,
+        ids=ids,
+        poll_interval_s=0.05,
+        max_polls=1000,
+    )
+    outdir = (
+        Path(config.settings.paths.home)
+        / "data"
+        / "previews"
+        / "audition_media"
+        / datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    )
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    input_assets: list[AssetRef] = []
+    for ref_path in ref_paths:
+        input_assets.append(_store_reference(cas, ref_path))
+    if image_path is not None:
+        input_assets.append(_store_reference(cas, image_path))
+
+    report_lines = [
+        f"media audition ({kind})",
+        f"models: {', '.join(keys)}",
+        f"aspect: {aspect_enum.value}",
+        f"cap_usd: {cap_usd}",
+        "",
+    ]
+    total_spent = 0
+    failures: list[str] = []
+    for (key, _entry, prompt), est in zip(plan, estimates, strict=True):
+        if total_spent + est > cap_musd:
+            failures.append(f"{key}: skipped — running total would exceed the cap")
+            continue
+        nonce_material = (
+            f"{key}|{kind}|{aspect_enum.value}|{duration}|{prompt}|"
+            + ",".join(r.name for r in ref_paths)
+            + (f"|{image_path.name}" if image_path is not None else "")
+            + "|seed=0"
+        ).encode("utf-8")
+        nonce = hashlib.sha256(nonce_material).hexdigest()[:16]
+        if kind == "image":
+            request = MediaRequest(
+                capability="image_reference_generate",
+                params={"prompt": prompt},
+                input_assets=input_assets,
+                aspect=aspect_enum,
+                seed=0,
+            )
+            call = gateway.image
+        else:
+            request = MediaRequest(
+                capability="image_to_video",
+                params={"prompt": prompt},
+                input_assets=input_assets,
+                aspect=aspect_enum,
+                duration_s=duration,
+                seed=0,
+            )
+            call = gateway.video
+        ctx = CallContext(
+            episode_id=None,
+            stage_run_id=None,
+            nonce=nonce,
+            purpose="media_audition",
+            gate_exempt="media_audition",
+        )
+        try:
+            result = _run_async(call(key, request, ctx))
+        except Exception as exc:
+            failures.append(f"{key}:{prompt[:24]}: {type(exc).__name__}: {exc}")
+            continue
+        ref = result.assets[0]
+        source_path = cas.resolve(ref.sha256)
+        target = outdir / f"{key.replace('.', '-')}-{nonce}{source_path.suffix or '.bin'}"
+        shutil.copy2(source_path, target)
+        total_spent += int(result.cost_musd)
+        expected_frames = None
+        if kind == "clip":
+            from studio.media.conform import clip_frames_for
+
+            expected_frames = clip_frames_for(
+                int(duration * 1000), int(config.settings.render.fps)
+            )
+        qc_note = _audition_qc(
+            config,
+            target,
+            kind,
+            aspect_enum,
+            keyframe=image_path if kind == "clip" else None,
+            expected_frames=expected_frames,
+            expected_fps=int(config.settings.render.fps) if kind == "clip" else None,
+        )
+        report_lines.append(
+            f"{target.name}\tmodel={key}\tprompt={prompt[:80]}\t"
+            f"cost_usd={musd_to_usd(int(result.cost_musd)):.4f}\t{qc_note}"
+        )
+        console.print(f"  {target.name}  ${musd_to_usd(int(result.cost_musd)):.4f}  {qc_note}")
+
+    report_lines.append("")
+    report_lines.append(f"total_spent_usd: {musd_to_usd(total_spent):.4f}")
+    if failures:
+        report_lines.append("failures:")
+        report_lines.extend(f"  - {failure}" for failure in failures)
+    (outdir / "README.txt").write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+    console.print(f"audition written to {outdir}")
+    console.print(f"total spent: ${musd_to_usd(total_spent):.4f}")
+    if failures:
+        console.print(f"[yellow]{len(failures)} call(s) failed/skipped (see README.txt)[/yellow]")
+
+
+def _audition_qc(
+    config: AppConfig,
+    target: Path,
+    kind: str,
+    aspect: Any,
+    *,
+    keyframe: Path | None = None,
+    expected_frames: int | None = None,
+    expected_fps: int | None = None,
+) -> str:
+    from studio.qc.visual import qc_image, qc_video
+
+    try:
+        if kind == "image":
+            checks = _run_async(qc_image(target, aspect=aspect, settings=config.settings))
+        else:
+            checks = _run_async(
+                qc_video(
+                    target,
+                    aspect=aspect,
+                    settings=config.settings,
+                    keyframe_path=keyframe,
+                    expected_frames=expected_frames,
+                    expected_fps=expected_fps,
+                )
+            )
+    except Exception as exc:  # QC is informational in the audition report
+        return f"qc={type(exc).__name__}"
+    fails = sum(1 for c in checks if c.status == "fail")
+    warns = sum(1 for c in checks if c.status == "warn")
+    if kind != "clip":
+        return f"qc_fail={fails} qc_warn={warns}"
+    by_name = {check.name: check for check in checks}
+    parts = []
+    for name, label in (("frame_count", "frames"), ("fps", "fps"), ("first_frame_ssim", "ssim")):
+        check = by_name.get(name)
+        if check is not None:
+            parts.append(f"{label}={check.value}")
+    parts.append(f"qc_fail={fails} qc_warn={warns}")
+    return " ".join(parts)
+
+
+@media_app.command("smoke")
+def media_smoke(
+    cap_usd: float = typer.Option(3.00, "--cap-usd", help="Hard cap for the smoke run."),
+    yes: bool = typer.Option(False, "--yes", help="Proceed (required to spend)."),
+) -> None:
+    """Opt-in live smoke (§Q): 1 character, 2 shots, 5 s each, 9:16, draft profile.
+
+    Runs S8a → S8 → S10 through the real handlers against live fal in a
+    scratch STUDIO_HOME (a copy of this home's configs), with gates
+    auto-approved (draft profile policy). Writes the preview, per-call
+    costs, QC values and conform reports to data/previews/media_smoke/<ts>/
+    and prints the remote request ids for dashboard reconciliation.
+    Requires FAL_KEY; refuses when any needed registry entry is unconfirmed
+    or unpriced. Never usable in CI.
+    """
+    if not os.environ.get("FAL_KEY", "").strip():
+        _fail("FAL_KEY is not set — export it before running the live smoke")
+
+    from studio.domain.enums import Aspect
+    from studio.media.registry import media_model_entry, model_confirmation_problems
+    from studio.media.stages import _estimate_clip_cost, _estimate_image_cost
+
+    config, _db, _clock, _ids, _repos = _connect()
+    migrate(_db)
+    try:
+        resolved = config.registry.resolve_profile("draft")
+    except StudioError as exc:
+        problems: list[str] = []
+        for key, entry in sorted(config.registry.models.items()):
+            if entry.capability not in ("image_reference_generate", "image_to_video"):
+                continue
+            problems.extend(
+                f"{key}: {problem}" for problem in model_confirmation_problems(entry)
+            )
+        if problems:
+            listing = "\n- ".join(problems)
+            _fail(f"refusing the live smoke:\n- {exc}\n- {listing}")
+        _fail(f"draft profile does not resolve: {exc}")
+
+    named: dict[str, Any] = {}
+    needs: list[str] = []
+    for role in ("sheets", "keyframes", "clips"):
+        try:
+            key, entry = media_model_entry(config, resolved, role)
+        except StudioError as exc:
+            _fail(f"draft {role} model does not resolve: {exc}")
+        named[role] = (key, entry)
+        needs.extend(f"{role} ({key}): {problem}" for problem in model_confirmation_problems(entry))
+    if needs:
+        listing = "\n- ".join(needs)
+        _fail(
+            "refusing the live smoke — needed registry entries are not confirmed/priced:\n"
+            f"- {listing}\n"
+            "confirm them in model_registry.yaml (the operator owns that attestation)"
+        )
+
+    shot_ms = 5000
+    estimates: dict[str, int] = {}
+    for role, (key, entry) in named.items():
+        if role == "clips":
+            est = _estimate_clip_cost(entry, clip_duration_ms=shot_ms)
+        else:
+            est = _estimate_image_cost(entry, aspect=Aspect.TALL)
+        if est is None:
+            _fail(f"worst-case cost not computable offline for {key!r}; refusing to spend")
+        estimates[role] = est
+    worst = estimates["sheets"] + 2 * estimates["keyframes"] + 2 * estimates["clips"]
+    cap_musd = usd_to_musd(str(cap_usd))
+    console.print(
+        f"smoke worst case: sheet ${musd_to_usd(estimates['sheets']):.4f} + "
+        f"2 keyframes ${musd_to_usd(2 * estimates['keyframes']):.4f} + "
+        f"2 clips ${musd_to_usd(2 * estimates['clips']):.4f} = "
+        f"[bold]${musd_to_usd(worst):.4f}[/bold] (cap ${cap_usd:.4f})"
+    )
+    if worst > cap_musd:
+        _fail(f"worst-case smoke cost exceeds --cap-usd ({musd_to_usd(worst):.4f} > {cap_usd:.4f})")
+    if not yes:
+        _fail("aborted (nothing spent) — re-run with --yes to proceed")
+
+    rc = _run_media_smoke(
+        config, named=named, cap_usd=cap_usd, worst_case_musd=worst, estimates=estimates
+    )
+    raise typer.Exit(code=rc)
+
+
+def _run_media_smoke(
+    config: AppConfig,
+    *,
+    named: dict[str, Any],
+    cap_usd: float,
+    worst_case_musd: int,
+    estimates: dict[str, int],
+) -> int:
+    import json as _json
+    import shutil
+    import tempfile
+    from datetime import UTC, datetime
+
+    import yaml
+
+    from studio.config.loader import load_all
+    from studio.core.clock import SystemClock
+    from studio.core.ids import UlidIds
+    from studio.db import build_repos, migrate
+    from studio.db.connection import Database
+    from studio.domain.series_bible import BibleContent, CharacterBible
+    from studio.pipeline.dag import Dag
+    from studio.pipeline.engine import Engine
+    from studio.pipeline.specs import media_specs
+    from studio.pipeline.worker import Worker
+
+    real_home = Path(_home())
+    src_configs = Path(config.settings.paths.home) / "configs"
+    if not src_configs.is_dir():
+        _fail(f"configs not found at {src_configs}")
+    ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    scratch = Path(tempfile.mkdtemp(prefix="studio-media-smoke-"))
+    shutil.copytree(src_configs, scratch / "configs")
+    # Pin the scratch run to a single language and aspect.
+    settings_path = scratch / "configs" / "settings.yaml"
+    data = yaml.safe_load(settings_path.read_text(encoding="utf-8"))
+    data["languages"] = [Language.AR.value]
+    data["aspects"] = ["9:16"]
+    settings_path.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
+
+    previous_home = os.environ.get("STUDIO_HOME")
+    os.environ["STUDIO_HOME"] = str(scratch)
+    try:
+        sconfig = load_all(scratch)
+        sdb_path = Path(sconfig.settings.paths.db)
+        sdb_path.parent.mkdir(parents=True, exist_ok=True)
+        sdb = Database(sdb_path)
+        migrate(sdb)
+        sclock = SystemClock()
+        sids = UlidIds()
+        srepos = build_repos(sdb, sclock, sids)
+        scas = _cas(sconfig, sdb, sclock)
+
+        short = sids.new()[:8].lower()
+        series = srepos.content.create_series(
+            name="Studio Media Smoke", slug=f"studio-media-smoke-{short}"
+        )
+        srepos.content.create_character(
+            series_id=series.id, role="lead", name="Smoke Hero", voices_json="{}"
+        )
+        _bible, _created = srepos.bible.create_version(
+            series.id,
+            BibleContent(
+                title="Studio Media Smoke",
+                premise="A lone traveler crosses a neon desert at dusk.",
+                characters=[
+                    CharacterBible(
+                        name="Smoke Hero",
+                        description="A weathered traveler in a sun-bleached coat.",
+                        visual_tokens=["sun-bleached coat", "neon dusk", "weathered face"],
+                    )
+                ],
+                style_tokens=["cinematic", "film grain"],
+                tone=["quiet", "awe"],
+            ),
+            created_by="s1",
+        )
+        episode = srepos.content.create_episode(
+            series_id=series.id,
+            title="Media Smoke",
+            concept="A lone traveler crosses a neon desert at dusk.",
+            languages_json=f'["{Language.AR.value}"]',
+            aspects_json='["9:16"]',
+        )
+        track = srepos.content.create_track(episode_id=episode.id, aspect="9:16")
+        prompts = [
+            "A lone traveler in a sun-bleached coat walks through a "
+            "neon-lit desert at dusk, cinematic wide shot, anamorphic lens flare.",
+            "The traveler stops before a half-buried neon sign glowing "
+            "turquoise, close profile, wind moving through the coat, cinematic.",
+        ]
+        shot_ids: list[str] = []
+        for index, prompt in enumerate(prompts, start=1):
+            shot = srepos.content.create_shot(
+                track_id=track.id, shot_no=index, prompt=prompt, min_duration_ms=5000
+            )
+            srepos.content.set_shot_timing(
+                shot.id,
+                clip_duration_ms=5000,
+                speed_factor=1.0,
+                hold_frames=0,
+                timing_status="locked",
+            )
+            shot_ids.append(shot.id)
+
+        snapshot = {
+            "profile": "draft",
+            "media_models": {role: key for role, (key, _entry) in named.items()},
+            "smoke": True,
+        }
+        run_row = srepos.pipeline.create_run(
+            episode_id=episode.id,
+            profile="draft",
+            auto_approve=True,
+            config_snapshot_json=_json.dumps(snapshot, sort_keys=True),
+        )
+        srepos.jobs.enqueue(
+            kind="advance_run",
+            payload={"run_id": run_row.id},
+            dedupe_key=f"advance:{run_row.id}",
+        )
+        dag = Dag(media_specs(after=()))
+        engine = Engine(
+            db=sdb, repos=srepos, dag=dag, clock=sclock, config=sconfig, ids=sids,
+            llm_subset_only=False,
+        )
+        worker = Worker(sdb, engine, srepos, sconfig, sclock)
+        console.print(f"scratch home: {scratch}")
+        jobs = _run_async(worker.run(until_idle=True))
+        console.print(f"jobs executed: {jobs}")
+
+        failures = srepos.pipeline.list_stage_runs(run_row.id)
+        bad = [row for row in failures if row.status != "succeeded"]
+        _write_smoke_artifacts(
+            real_home=real_home,
+            scratch_db=sdb,
+            scratch_repos=srepos,
+            scas=scas,
+            series_id=series.id,
+            episode_id=episode.id,
+            run_id=run_row.id,
+            worst_case_musd=worst_case_musd,
+            ts=ts,
+        )
+        if bad:
+            for row in bad:
+                console.print(f"[red]stage {row.stage}: {row.status}[/red]")
+            console.print(f"scratch home kept at {scratch}")
+            return 1
+        console.print("smoke completed; scratch home kept at " + str(scratch))
+        return 0
+    finally:
+        if previous_home is None:
+            os.environ.pop("STUDIO_HOME", None)
+        else:
+            os.environ["STUDIO_HOME"] = previous_home
+
+
+def _write_smoke_artifacts(
+    *,
+    real_home: Path,
+    scratch_db: Database,
+    scratch_repos: StudioRepos,
+    scas: Any,
+    series_id: str,
+    episode_id: str,
+    run_id: str,
+    worst_case_musd: int,
+    ts: str,
+) -> None:
+    import json as _json
+
+    outdir = real_home / "data" / "previews" / "media_smoke" / ts
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    episode = scratch_repos.content.get_episode(episode_id)
+    assert episode is not None
+    tracks = {track.id: track for track in scratch_repos.content.list_tracks(episode_id)}
+    shots = {
+        shot.id: shot
+        for track in tracks.values()
+        for shot in scratch_repos.content.shots_for_track(track.id)
+    }
+    body = ["<h1>media smoke</h1>"]
+    body.append(
+        f'<p class="muted">scratch run <code>{_escape(run_id)}</code> · '
+        f'episode <code>{_escape(episode_id)}</code></p>'
+    )
+    sheet_events = list(scratch_repos.audit.list(event="character_sheet_generated", limit=100))
+    sheet_events += list(scratch_repos.audit.list(event="character_sheet_attempt", limit=100))
+    body.append(_render_sheets(scratch_repos, sheet_events, scas, outdir, series_id))
+    for kind in ("keyframe", "clip"):
+        body.append(_render_attempts(scratch_db, scas, outdir, shots, tracks, kind))
+    (outdir / "preview.html").write_text(
+        _preview_page("media smoke", "\n".join(body)), encoding="utf-8"
+    )
+
+    calls = scratch_db.connect().execute(
+        "SELECT capability, model_key, purpose, status, est_cost_musd, actual_cost_musd, "
+        "remote_request_id FROM provider_calls ORDER BY created_at, id"
+    ).fetchall()
+    total_actual = sum(int(row["actual_cost_musd"] or 0) for row in calls)
+    lines = [
+        "media smoke report",
+        f"run_id: {run_id}",
+        f"episode_id: {episode_id}",
+        f"worst_case_usd: {musd_to_usd(worst_case_musd):.4f}",
+        f"actual_cost_usd: {musd_to_usd(total_actual):.4f}",
+        "",
+        "remote request ids (reconcile against the fal dashboard):",
+    ]
+    for row in calls:
+        rid = row["remote_request_id"] or "(none)"
+        cost = musd_to_usd(int(row["actual_cost_musd"] or row["est_cost_musd"] or 0))
+        lines.append(f"  {row['capability']}/{row['model_key']} {rid} cost_usd={cost}")
+    lines.append("")
+    lines.append("ledger vs expected:")
+    ledger_rows = scratch_db.connect().execute(
+        "SELECT entry_type, COALESCE(SUM(amount_musd), 0) AS total FROM cost_ledger "
+        "GROUP BY entry_type"
+    ).fetchall()
+    for row in ledger_rows:
+        lines.append(f"  {row['entry_type']}: {musd_to_usd(int(row['total'])):.4f}")
+    lines.append(f"  expected worst case: {musd_to_usd(worst_case_musd):.4f}")
+    lines.append("")
+    lines.append("QC values (from attempt bookkeeping, incl. SSIM / freeze ratios):")
+    attempts = scratch_db.connect().execute(
+        "SELECT shot_id, kind, attempt_no, qc_status, qc_json, cost_musd FROM shot_attempts "
+        "ORDER BY shot_id, kind, attempt_no"
+    ).fetchall()
+    for row in attempts:
+        lines.append(
+            f"  shot={row['shot_id']} kind={row['kind']} attempt={row['attempt_no']} "
+            f"qc={row['qc_status']} cost_usd={musd_to_usd(int(row['cost_musd'])):.4f}"
+        )
+        try:
+            checks = _json.loads(row["qc_json"] or "[]")
+        except _json.JSONDecodeError:
+            checks = []
+        for check in checks:
+            if not isinstance(check, dict):
+                continue
+            lines.append(
+                f"    - {check.get('name')}: {check.get('status')} value={check.get('value')} "
+                f"threshold={check.get('threshold')}"
+            )
+    lines.append("")
+    lines.append("conform reports (from s10 stage output):")
+    outputs = scratch_db.connect().execute(
+        "SELECT subject_id, output_json FROM stage_runs WHERE stage = 's10_clips' "
+        "ORDER BY created_at"
+    ).fetchall()
+    for row in outputs:
+        try:
+            payload = _json.loads(row["output_json"] or "{}")
+        except _json.JSONDecodeError:
+            payload = {}
+        conform = payload.get("conform", {})
+        lines.append(f"  subject={row['subject_id']}")
+        lines.append(_json.dumps(conform, indent=2, sort_keys=True))
+    (outdir / "report.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    console.print(f"smoke artifacts written to {outdir}")
+    console.print("request ids:")
+    for row in calls:
+        if row["remote_request_id"]:
+            console.print(f"  {row['capability']}: {row['remote_request_id']}")
+    console.print(
+        f"ledger vs expected: actual ${musd_to_usd(total_actual):.4f} "
+        f"vs worst case ${musd_to_usd(worst_case_musd):.4f}"
+    )
 
 def main() -> None:  # pragma: no cover
     app()

@@ -26,6 +26,7 @@ class Dag:
         self._by_name = {spec.name: spec for spec in self._specs}
         self._order = [spec.name for spec in self._specs]
         self._downstream = self._transitive_downstream(specs)
+        self._upstream = self._transitive_upstream(specs)
 
     # ---- API ------------------------------------------------------------
 
@@ -45,6 +46,10 @@ class Dag:
 
     def downstream(self, name: str) -> frozenset[str]:
         return self._downstream.get(name, frozenset())
+
+    def ancestors(self, name: str) -> frozenset[str]:
+        """Transitive `depends_on` closure (H0 gate barrier)."""
+        return self._upstream.get(name, frozenset())
 
     # ---- internals --------------------------------------------------------
 
@@ -74,6 +79,26 @@ class Dag:
                 if name in other.depends_on:
                     indegree[other.name] -= 1
         return ordered
+
+    @staticmethod
+    def _transitive_upstream(specs: list[StageSpec]) -> dict[str, frozenset[str]]:
+        result: dict[str, frozenset[str]] = {}
+        by_name = {spec.name: spec for spec in specs}
+
+        def expand(name: str) -> set[str]:
+            seen: set[str] = set()
+            stack = list(by_name[name].depends_on)
+            while stack:
+                current = stack.pop()
+                if current in seen or current not in by_name:
+                    continue
+                seen.add(current)
+                stack.extend(by_name[current].depends_on)
+            return seen
+
+        for spec in specs:
+            result[spec.name] = frozenset(expand(spec.name))
+        return result
 
     @staticmethod
     def _transitive_downstream(specs: list[StageSpec]) -> dict[str, frozenset[str]]:

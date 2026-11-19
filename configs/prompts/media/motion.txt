@@ -1,0 +1,3 @@
+Animate this still with gentle, natural motion. Keep the composition, characters
+and lighting stable; only the described action moves. No camera shake, no morphing.
+This file's bytes are part of the media prompt-version sha.

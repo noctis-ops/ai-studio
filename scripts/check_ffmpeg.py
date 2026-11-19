@@ -1,4 +1,4 @@
-"""D3 CI capability check: ffmpeg >= 5.0 + the audio filter set Phase 3 needs.
+"""D3/H3 CI capability check: ffmpeg >= 5.0 + audio and visual filter sets.
 
 Shares `studio.video.ffmpeg.capability_check` with `studio doctor` and
 tests/test_ffmpeg_capabilities.py so CI, doctor and tests can never drift.
