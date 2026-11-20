@@ -32,3 +32,7 @@ class RunContext:
     languages: list[Language]
     aspects: list[Aspect]
     stage_run_id: str | None = None
+    # H0: free stages and Phase 1-3 demo handlers keep the permissive default.
+    # The engine lowers this to False only for paid stages, then raises it
+    # again after assert_gates_cleared() proves every ancestor gate current.
+    gate_cleared: bool = True

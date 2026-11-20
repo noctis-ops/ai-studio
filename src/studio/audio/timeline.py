@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from math import ceil
@@ -80,6 +81,43 @@ class Timeline:
     @property
     def samples_per_frame(self) -> int:
         return self.sample_rate // self.fps
+
+
+def choose_supported_duration_ms(
+    *,
+    needed_frames: int,
+    supported_durations_s: Sequence[int],
+    fps: int,
+    timing: TimingSettings,
+) -> int | None:
+    """Pure S6 duration selection, shared with the Gate-1 media estimate (H2).
+
+    Returns the cheapest supported duration in milliseconds whose clip fits
+    `needed_frames`, either plainly or with the configured stretch+hold
+    capacity. `None` means overflow; the caller reports it in typed detail.
+    """
+    if fps <= 0 or needed_frames < 0:
+        raise StudioError(f"invalid frame request: fps={fps}, needed_frames={needed_frames}")
+    durations = sorted({int(d) for d in supported_durations_s})
+    if not durations:
+        raise StudioError("no supported video durations declared")
+    max_hold_frames = int(timing.max_hold_ms) * fps // 1000
+
+    def capacity(frames: int) -> int:
+        return math.ceil(frames * float(timing.max_stretch)) + max_hold_frames
+
+    plain: int | None = None
+    squeeze: int | None = None
+    for seconds in durations:
+        frames = int(seconds) * fps
+        if needed_frames <= frames and plain is None:
+            plain = int(seconds) * 1000
+        if timing.prefer_stretch_to_save_cost and needed_frames <= capacity(frames):
+            if squeeze is None:
+                squeeze = int(seconds) * 1000
+    if squeeze is not None and (plain is None or squeeze < plain):
+        return squeeze
+    return plain
 
 
 def _ms_to_samples(ms: int | float, sample_rate: int) -> int:

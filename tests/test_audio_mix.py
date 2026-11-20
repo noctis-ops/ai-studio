@@ -73,7 +73,7 @@ def _read_s16_mono(path: Path) -> list[int]:
     assert ffmpeg is not None
     ext = path.suffix.lower().lstrip(".")
     hint = ["-f", ext] if ext else []
-    proc = subprocess.run(  # noqa: S603 - fixed argv, no shell
+    proc = subprocess.run(
         [ffmpeg, "-hide_banner", "-v", "error", *hint, "-i", str(path),
          "-ac", "1", "-f", "s16le", "pipe:1"],
         check=True, capture_output=True,

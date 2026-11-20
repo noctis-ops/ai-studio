@@ -78,6 +78,18 @@ class ShotAttemptRow(_Row):
     prompt_used: str
     rejection_note: str | None
     created_at: str
+    # Phase 4 (migration 005): media attempt bookkeeping. All additive.
+    kind: str = "keyframe"
+    prompt_spec_json: str | None = None
+    sanitize_level: int = 0
+    refusal_log_json: str = "[]"
+    qc_status: str = "pending"
+    qc_json: str = "[]"
+    asset_id: str | None = None
+    conformed_asset_id: str | None = None
+    cost_musd: int = 0
+    provider_call_id: str | None = None
+    policy_blocked: int = 0
 
 
 class NarrationLineRow(_Row):
@@ -127,6 +139,20 @@ class SceneRow(_Row):
     intensity: int = 3
     ambience_tags_json: str = "[]"
     created_at: str
+
+
+class CharacterSheetRow(_Row):
+    id: str
+    series_id: str
+    character_id: str
+    role: str
+    version: int
+    asset_id: str
+    status: str
+    spec_hash: str
+    nonce: str
+    created_at: str
+    approved_at: str | None = None
 
 
 class CharacterVoiceRow(_Row):
@@ -259,6 +285,9 @@ class ProviderCallRow(_Row):
     error_message: str | None
     created_at: str
     updated_at: str
+    # Phase 4 / migration 005: the fal queue's four URLs, persisted in the
+    # same statement as remote_request_id.
+    remote_handle_json: str | None = None
 
 
 class JobRow(_Row):

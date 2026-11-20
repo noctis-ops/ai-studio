@@ -3,7 +3,7 @@ shots, shot attempts and narration lines."""
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Any, Protocol
 
 from studio.domain.models import (
     CharacterRow,
@@ -80,7 +80,17 @@ class ContentRepo(Protocol):
 
     def shots_for_track(self, track_id: str) -> list[ShotRow]: ...
 
-    def current_shot_attempt(self, shot_id: str) -> ShotAttemptRow | None: ...
+    def current_shot_attempt(
+        self, shot_id: str, *, kind: str | None = None
+    ) -> ShotAttemptRow | None: ...
+
+    def next_shot_attempt_no(self, shot_id: str) -> int: ...
+
+    def update_shot_attempt(self, attempt_id: str, **fields: Any) -> ShotAttemptRow | None:
+        """Update media bookkeeping columns on an attempt (whitelist)."""
+        ...
+
+    def get_shot_attempt(self, attempt_id: str) -> ShotAttemptRow | None: ...
 
     def create_shot_attempt(
         self,
@@ -90,6 +100,7 @@ class ContentRepo(Protocol):
         nonce: str,
         prompt_used: str,
         rejection_note: str | None = None,
+        kind: str = "keyframe",
     ) -> ShotAttemptRow: ...
 
     def upsert_narration_line(
@@ -420,13 +431,78 @@ class SqliteContentRepo(SqliteRepo):
         )
         return [ShotRow.model_validate(row_to_dict(r)) for r in rows]
 
-    def current_shot_attempt(self, shot_id: str) -> ShotAttemptRow | None:
+    def current_shot_attempt(
+        self, shot_id: str, *, kind: str | None = None
+    ) -> ShotAttemptRow | None:
+        if kind is None:
+            row = (
+                self.db.connect()
+                .execute(
+                    "SELECT * FROM shot_attempts WHERE shot_id = ? "
+                    "ORDER BY attempt_no DESC, created_at DESC LIMIT 1",
+                    (shot_id,),
+                )
+                .fetchone()
+            )
+        else:
+            row = (
+                self.db.connect()
+                .execute(
+                    "SELECT * FROM shot_attempts WHERE shot_id = ? AND kind = ? "
+                    "ORDER BY attempt_no DESC, created_at DESC LIMIT 1",
+                    (shot_id, kind),
+                )
+                .fetchone()
+            )
+        return ShotAttemptRow.model_validate(row_to_dict(row)) if row else None
+
+    def next_shot_attempt_no(self, shot_id: str) -> int:
         row = (
             self.db.connect()
             .execute(
-                "SELECT * FROM shot_attempts WHERE shot_id = ? ORDER BY attempt_no DESC LIMIT 1",
+                "SELECT COALESCE(MAX(attempt_no), 0) AS m FROM shot_attempts WHERE shot_id = ?",
                 (shot_id,),
             )
+            .fetchone()
+        )
+        return int(row["m"]) + 1 if row else 1
+
+    # Phase 4 (migration 005) media bookkeeping whitelist.
+    _ATTEMPT_UPDATABLE = frozenset(
+        {
+            "nonce",
+            "prompt_spec_json",
+            "sanitize_level",
+            "refusal_log_json",
+            "qc_status",
+            "qc_json",
+            "asset_id",
+            "conformed_asset_id",
+            "cost_musd",
+            "provider_call_id",
+            "policy_blocked",
+        }
+    )
+
+    def update_shot_attempt(self, attempt_id: str, **fields: Any) -> ShotAttemptRow | None:
+        unknown = sorted(set(fields) - self._ATTEMPT_UPDATABLE)
+        if unknown:
+            raise ValueError(f"shot_attempts columns not updatable: {', '.join(unknown)}")
+        if not fields:
+            return self.get_shot_attempt(attempt_id)
+        conn = self.db.connect()
+        assignments = ", ".join(f"{column} = ?" for column in fields)
+        values = [fields[column] for column in fields]
+        conn.execute(
+            f"UPDATE shot_attempts SET {assignments} WHERE id = ?",  # noqa: S608
+            (*values, attempt_id),
+        )
+        return self.get_shot_attempt(attempt_id)
+
+    def get_shot_attempt(self, attempt_id: str) -> ShotAttemptRow | None:
+        row = (
+            self.db.connect()
+            .execute("SELECT * FROM shot_attempts WHERE id = ?", (attempt_id,))
             .fetchone()
         )
         return ShotAttemptRow.model_validate(row_to_dict(row)) if row else None
@@ -439,6 +515,7 @@ class SqliteContentRepo(SqliteRepo):
         nonce: str,
         prompt_used: str,
         rejection_note: str | None = None,
+        kind: str = "keyframe",
     ) -> ShotAttemptRow:
         now = self._now()
         attempt_id = self._new_id()
@@ -446,10 +523,10 @@ class SqliteContentRepo(SqliteRepo):
         conn.execute(
             """
             INSERT INTO shot_attempts(id, shot_id, attempt_no, nonce, prompt_used,
-                                      rejection_note, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                                      rejection_note, created_at, kind)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (attempt_id, shot_id, attempt_no, nonce, prompt_used, rejection_note, now),
+            (attempt_id, shot_id, attempt_no, nonce, prompt_used, rejection_note, now, kind),
         )
         row = conn.execute("SELECT * FROM shot_attempts WHERE id = ?", (attempt_id,)).fetchone()
         assert row is not None

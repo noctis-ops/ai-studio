@@ -212,17 +212,28 @@ _ALLOWED_PREFIXES = ("config/", "language/")
 _ALLOWED_FILES = {"domain/enums.py"}
 
 
+# Phase 4 packages: the lint must keep covering them (T-LANG-01).
+_PHASE4_PACKAGES = ("media", "qc", "video")
+
+
 def test_no_hardcoded_language_codes_outside_allowlist():
     root = REPO_ROOT / "src" / "studio"
     offenders: list[tuple[str, int, str]] = []
+    scanned: list[str] = []
     for path in sorted(root.rglob("*.py")):
         rel = path.relative_to(root).as_posix()
         if rel in _ALLOWED_FILES or any(rel.startswith(p) for p in _ALLOWED_PREFIXES):
             continue
+        scanned.append(rel)
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.Constant) and node.value in ("ar", "en"):
                 offenders.append((rel, node.lineno, node.value))
+    # the lint really did scan the Phase 4 packages, not just the text stack
+    for package in _PHASE4_PACKAGES:
+        assert any(rel.startswith(f"{package}/") for rel in scanned), (
+            f"T-LANG-01 lint did not scan src/studio/{package}/"
+        )
     assert offenders == [], f"hardcoded language codes outside allow-list: {offenders}"
 
 

@@ -168,7 +168,7 @@ def _sine(path: Path, *, duration=2.0, freq=1000, volume: float | None = None) -
     graph = f"sine=frequency={freq}:duration={duration}"
     if volume is not None:
         graph += f",volume={volume}"
-    subprocess.run(  # noqa: S603
+    subprocess.run(
         [shutil.which("ffmpeg") or "ffmpeg", "-nostats", "-hide_banner", "-y",
          "-f", "lavfi", "-i", graph,
          "-c:a", "pcm_s16le", str(path)],
@@ -483,7 +483,7 @@ async def test_conform_trims_to_keep_ms_and_limits_peak(tmp_path, monkeypatch):
     sr = int(config.settings.audio.sample_rate)
     raw = tmp_path / "raw.wav"
     # 500 ms silence + 2.0 s tone + 700 ms silence
-    subprocess.run(  # noqa: S603, ASYNC221
+    subprocess.run(  # noqa: ASYNC221
         [shutil.which("ffmpeg") or "ffmpeg", "-nostats", "-hide_banner", "-y",
          "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono:d=0.5",
          "-f", "lavfi", "-i", "sine=frequency=440:duration=2.0:sample_rate=48000",

@@ -10,6 +10,7 @@ import os
 import re
 from decimal import Decimal
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -211,6 +212,86 @@ class TextPipelineSettings(_Strict):
     s4_after_g1: bool = True
 
 
+# ---------------------------------------------------------------------------
+# Phase 4 (media) settings — all QC/poll thresholds are config, not constants
+# ---------------------------------------------------------------------------
+
+
+class FalSettings(_Strict):
+    queue_base_url: str = "https://queue.fal.run"
+    key_env: str = "FAL_KEY"
+    request_timeout_s: float = Field(default=60.0, gt=0)
+    download_timeout_s: float = Field(default=120.0, gt=0)
+    download_retries: int = Field(default=3, ge=0)
+
+
+class MediaPollSettings(_Strict):
+    initial_s: float = Field(default=3.0, gt=0)
+    max_s: float = Field(default=15.0, gt=0)
+    backoff: float = Field(default=1.5, gt=1.0)
+    max_wait_s: float = Field(default=900.0, gt=0)
+
+
+class MediaImageQcSettings(_Strict):
+    min_short_side_px: int = Field(default=512, ge=1)
+    aspect_tolerance_pct: float = Field(default=2.0, gt=0)
+    min_bytes: int = Field(default=5000, ge=0)
+    min_luma_mean: float = Field(default=8.0, ge=0)
+    min_luma_stddev: float = Field(default=3.0, ge=0)
+    auto_retries: int = Field(default=2, ge=0)
+
+
+class MediaVideoQcSettings(_Strict):
+    aspect_tolerance_pct: float = Field(default=2.0, gt=0)
+    min_bytes: int = Field(default=20000, ge=0)
+    black_fail_ratio: float = Field(default=0.15, gt=0, le=1)
+    black_pic_th: float = Field(default=0.98, gt=0, le=1)
+    black_min_d_s: float = Field(default=0.1, gt=0)
+    freeze_warn_ratio: float = Field(default=0.5, ge=0, le=1)
+    freeze_fail_ratio: float = Field(default=0.85, ge=0, le=1)
+    first_frame_black_luma: float = Field(default=8.0, ge=0)
+    first_frame_ssim_warn: float = Field(default=0.6, ge=0, le=1)
+    first_frame_ssim_fail: float = Field(default=0.0, ge=0, le=1)
+    auto_retries: int = Field(default=1, ge=0)
+
+
+class MediaClipSettings(_Strict):
+    duration_tolerance_ms: int = Field(default=500, ge=0)
+    conform_crf: int = Field(default=14, ge=0, le=51)
+    strip_audio: bool = True
+
+
+class MediaQcSettings(_Strict):
+    image: MediaImageQcSettings = MediaImageQcSettings()
+    video: MediaVideoQcSettings = MediaVideoQcSettings()
+
+
+class MediaSettings(_Strict):
+    poll: MediaPollSettings = MediaPollSettings()
+    max_paid_attempts_per_shot: int = Field(default=4, ge=1)
+    circuit_breaker_consecutive_failures: int = Field(default=3, ge=1)
+    failed_job_billing: Literal["charge", "free"] = "charge"
+    assumed_retry_rate: dict[str, float] = {"image": 0.25, "video": 0.30}
+    ref_max_side_px: int = Field(default=1024, ge=16)
+    ref_jpeg_quality: int = Field(default=90, ge=1, le=100)
+    max_inline_bytes: int = Field(default=8_000_000, ge=1)
+    refs_overflow: Literal["primary_only", "fail"] = "primary_only"
+    chain_mode: str = "off"
+    clip: MediaClipSettings = MediaClipSettings()
+    qc: MediaQcSettings = MediaQcSettings()
+
+
+class CharacterSheetsSettings(_Strict):
+    roles: list[str] = ["ref_full"]
+    aspect: str = "9:16"
+
+
+class SanitizerSettings(_Strict):
+    max_levels: int = Field(default=2, ge=0)
+    model_key: str = "llm.light"
+    max_scene_chars: int = Field(default=600, ge=1)
+
+
 def _dedupe(values: list[str], *, what: str) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
@@ -240,6 +321,10 @@ class Settings(_Strict):
     tts: TtsSettings = TtsSettings()
     timing: TimingSettings = TimingSettings()
     audio: AudioSettings = AudioSettings()
+    fal: FalSettings = FalSettings()
+    media: MediaSettings = MediaSettings()
+    character_sheets: CharacterSheetsSettings = CharacterSheetsSettings()
+    sanitizer: SanitizerSettings = SanitizerSettings()
 
     @model_validator(mode="after")
     def _check_cross_field(self) -> Settings:
@@ -279,6 +364,28 @@ class Settings(_Strict):
                 raise ConfigError(
                     f"audio.levels.intensity_offset_db has intensity {level}; expected 1..5"
                 )
+        # ---- Phase 4 config validation (§E2) -------------------------------
+        if self.media.chain_mode == "last_frame":
+            raise ConfigError("last_frame chaining not supported before Phase 5")
+        if self.media.chain_mode != "off":
+            raise ConfigError(
+                f"media.chain_mode must be 'off', got {self.media.chain_mode!r}"
+            )
+        for name, ratio in self.media.assumed_retry_rate.items():
+            if not 0 < ratio <= 1:
+                raise ConfigError(
+                    f"media.assumed_retry_rate[{name!r}] must be in (0, 1], got {ratio}"
+                )
+        if not 0 < self.media.qc.video.black_fail_ratio <= 1:
+            raise ConfigError("media.qc.video.black_fail_ratio must be in (0, 1]")
+        if not self.character_sheets.roles:
+            raise ConfigError("character_sheets.roles must not be empty")
+        if self.character_sheets.aspect not in {member.value for member in Aspect}:
+            raise ConfigError(
+                f"character_sheets.aspect has unsupported value {self.character_sheets.aspect!r}"
+            )
+        if self.media.poll.max_s < self.media.poll.initial_s:
+            raise ConfigError("media.poll.max_s must be >= media.poll.initial_s")
         return self
 
     @field_validator("languages", mode="before")

@@ -58,14 +58,16 @@ async def _run(binary: str, args: list[str], *, timeout_s: float, tool: str) -> 
 # Phase 3 extensions (H5/H9/H10, D3)
 # =====================================================================
 
-# D3: exact filter set the audio chain relies on (mastering, ducking,
-# conform, QC). `asplit`/`volumedetect` are required by the ducking/envelope
-# design; the rest mirrors PHASE3 §D3.
+# D3 + H3: exact filter set the audio chain and Phase 4 visual QC rely on.
+# `asplit` is required by the ducking/envelope design; the second block is
+# the video/QC set from PHASE4_IMPLEMENTATION_PROMPT.md §D H3.
 REQUIRED_FILTERS = (
     "loudnorm", "ebur128", "astats", "sidechaincompress", "volume", "amix",
     "adelay", "afade", "atrim", "apad", "aresample", "aformat",
     "silenceremove", "areverse", "alimiter", "anullsrc", "asetnsamples",
     "ametadata", "pan", "asplit",
+    "signalstats", "blackdetect", "freezedetect", "ssim", "fps", "trim",
+    "setpts", "tpad", "scale", "setsar", "format",
 )
 
 _version_cache: tuple[int, int, int] | None = None

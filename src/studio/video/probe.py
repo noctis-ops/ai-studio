@@ -34,13 +34,26 @@ def _parse_fraction(text: str) -> float | None:
         return None
 
 
+# Single-frame stills are reported as a *video* stream by ffprobe.  `png`,
+# `jpg`, `webp` ... are codec names, not demuxer names, so `-f <extension>`
+# must never be passed to ffprobe (ffprobe >= 5 rejects e.g. `-f png` with
+# "Unknown input format").  Let ffprobe auto-detect the container instead and
+# classify stills from the extension / pipe demuxer.
+_STILL_IMAGE_EXTS = frozenset({"png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "apng"})
+_STILL_IMAGE_DEMUXERS = frozenset(
+    {"png_pipe", "mjpeg_pipe", "jpeg_pipe", "webp_pipe", "bmp_pipe", "tiff_pipe", "apng"}
+)
+
+
 def probe(path: Path) -> ProbeResult:
     binary = find_binary("ffprobe")
-    ext = path.suffix.lower().lstrip(".") if hasattr(path, "suffix") else ""
-    cmd = [binary, "-v", "error"]
-    if ext:
-        cmd += ["-f", ext]
-    cmd += [
+    ext = path.suffix.lower().lstrip(".")
+    # Deliberately no `-f`: forcing the file extension as a demuxer breaks on
+    # real ffprobe for every still-image format and is redundant elsewhere.
+    cmd = [
+        binary,
+        "-v",
+        "error",
         "-print_format",
         "json",
         "-show_format",
@@ -68,6 +81,11 @@ def probe(path: Path) -> ProbeResult:
     fmt = data.get("format") or {}
     vstream = next((s for s in streams if s.get("codec_type") == "video"), None)
     astream = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    demuxers = {
+        part.strip().lower()
+        for part in str(fmt.get("format_name") or "").split(",")
+        if part.strip()
+    }
 
     duration_ms: int | None = None
     raw_duration = fmt.get("duration") or (vstream or astream or {}).get("duration")
@@ -83,13 +101,16 @@ def probe(path: Path) -> ProbeResult:
     audio_channels = int(astream["channels"]) if astream and astream.get("channels") else None
 
     if vstream is not None:
-        # single-frame videos are still images on disk (png); ffprobe reports
-        # them as video streams with nb_frames == 1
+        # Single-frame videos are still images on disk (png).  Depending on
+        # the ffprobe version, stills report nb_frames == 1, nb_frames absent,
+        # or an image-pipe demuxer; classify on all three signals.
         nb_frames = vstream.get("nb_frames")
-        if str(nb_frames) == "1":
-            kind = "image"
-        else:
-            kind = "video"
+        is_still = (
+            str(nb_frames) == "1"
+            or ext in _STILL_IMAGE_EXTS
+            or bool(demuxers & _STILL_IMAGE_DEMUXERS)
+        )
+        kind = "image" if is_still else "video"
     elif astream is not None:
         kind = "audio"
     else:

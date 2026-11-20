@@ -1,0 +1,4 @@
+Rewrite the scene description so it implies the action without describing it
+graphically. Never add content, never change who is present or where the scene
+takes place, never mention the locked style or character descriptions. Return
+only the rewritten scene text, in English, with no preamble.

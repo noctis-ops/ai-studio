@@ -23,6 +23,8 @@ from studio.domain.refs import SubjectRef, subjects_related
 from studio.pipeline.dag import Dag
 from studio.pipeline.subjects import shot_subject
 
+_SHEETS_STAGE = "s8a_character_sheets"
+
 
 @dataclass(frozen=True)
 class ShotRejection:
@@ -98,6 +100,7 @@ class GateService:
                     "profile": profile,
                 },
             )
+            self._after_gate_approved(decided)
             return decided, True
         self.repos.audit.append(
             actor="gates",
@@ -125,6 +128,7 @@ class GateService:
                 "note": note,
             },
         )
+        self._after_gate_approved(decided)
         self._set_run_running(gate.run_id)
         self._enqueue_advance(gate.run_id)
         return decided
@@ -136,8 +140,10 @@ class GateService:
         rejections: list[ShotRejection],
     ) -> GateRow:
         if not rejections:
-            raise GatePolicyError("request_changes requires at least one rejected shot")
+            raise GatePolicyError("request_changes requires at least one rejected item")
         gate = self._pending_gate(gate_id)
+        if gate.stage == _SHEETS_STAGE:
+            return self._request_changes_sheets(gate, note, rejections)
         affected: list[str] = []
         downstream = sorted(self.dag.downstream(gate.stage))
         stages_to_stale = {gate.stage, *downstream}
@@ -199,6 +205,98 @@ class GateService:
         return [g for g in self.repos.gates.list_for_run(run_id) if g.stage == stage]
 
     # ---- internals -----------------------------------------------------------
+
+    def _series_for_run(self, run_id: str) -> str | None:
+        run = self.repos.pipeline.get_run(run_id)
+        if run is None or not run.episode_id:
+            return None
+        episode = self.repos.content.get_episode(run.episode_id)
+        return episode.series_id if episode is not None else None
+
+    def _after_gate_approved(self, gate: GateRow) -> None:
+        """Side effects of approval that live outside the generic gate row.
+
+        G0 (character sheets): flip the newest candidate rows to approved and
+        supersede older ones, atomically.
+        """
+        if gate.stage != _SHEETS_STAGE:
+            return
+        series_id = self._series_for_run(gate.run_id)
+        if series_id is None:
+            return
+        approved = self.repos.sheets.approve_latest_candidates(series_id)
+        self.repos.audit.append(
+            actor="gates",
+            entity=f"gate:{gate.id}",
+            event="sheets_approved",
+            payload={
+                "run_id": gate.run_id,
+                "gate_id": gate.id,
+                "series_id": series_id,
+                "approved": [f"{row.character_id}:{row.role}" for row in approved],
+            },
+        )
+
+    def _request_changes_sheets(
+        self,
+        gate: GateRow,
+        note: str | None,
+        rejections: list[ShotRejection],
+    ) -> GateRow:
+        """G0 reject: mark the named sheet rows rejected and stale the S8a runs.
+
+        `rejections[*].shot_id` carries the sheet row id. Only the rejected
+        (character, role) pairs regenerate on the next advance, with a new
+        nonce and the usual cost check; approved characters are untouched.
+        """
+        series_id = self._series_for_run(gate.run_id)
+        if series_id is None:
+            raise GatePolicyError(f"run {gate.run_id} has no resolvable series")
+        rejected: list[str] = []
+        stale_subjects: list[str] = []
+        for rejection in rejections:
+            sheet = self.repos.sheets.get(rejection.shot_id)
+            if sheet is None:
+                raise GatePolicyError(f"unknown character sheet: {rejection.shot_id}")
+            if sheet.series_id != series_id:
+                raise GatePolicyError(
+                    f"sheet {sheet.id} belongs to a different series"
+                )
+            rejected.append(sheet.id)
+            stale_subjects.append(f"{sheet.character_id}::{sheet.role}")
+        count = self.repos.sheets.reject(rejected)
+        # Stale only the rejected sheets' own stage runs. Downstream (keyframes,
+        # clips) stales automatically: regenerated sheet -> new sha -> changed
+        # input_hash (rule 4). The new sheet candidate parks the run at G0
+        # round 2 before any paid downstream stage can run.
+        affected: list[str] = []
+        for row in self.repos.pipeline.list_stage_runs(gate.run_id, stage=gate.stage):
+            if row.status not in ("succeeded", "pending", "running", "stale"):
+                continue
+            if row.subject_id in stale_subjects:
+                affected.append(row.id)
+        if affected:
+            self.repos.pipeline.mark_stale(affected)
+        decided = self.repos.gates.decide(gate.id, status="changes_requested", note=note)
+        assert decided is not None
+        self.repos.audit.append(
+            actor="operator",
+            entity=f"gate:{gate.id}",
+            event="gate_changes_requested",
+            payload={
+                "run_id": gate.run_id,
+                "stage": gate.stage,
+                "gate": gate.gate,
+                "round": gate.round,
+                "note": note,
+                "rejected_sheets": rejected,
+                "sheets_rejected": count,
+                "staled_stage_runs": sorted(set(affected)),
+            },
+        )
+        self._set_run_running(gate.run_id)
+        self._enqueue_advance(gate.run_id)
+        return decided
 
     def _pending_gate(self, gate_id: str) -> GateRow:
         gate = self.repos.gates.get(gate_id)

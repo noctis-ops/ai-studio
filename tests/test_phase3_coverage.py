@@ -64,7 +64,7 @@ def _sine_file(path: Path, *, duration=1.0, freq=1000, volume: float | None = No
     graph = f"sine=frequency={freq}:duration={duration}"
     if volume is not None:
         graph += f",volume={volume}"
-    subprocess.run(  # noqa: S603
+    subprocess.run(
         [shutil.which("ffmpeg") or "ffmpeg", "-nostats", "-hide_banner", "-y",
          "-f", "lavfi", "-i", graph, "-c:a", "pcm_s16le", str(path)],
         check=True, capture_output=True,

@@ -23,6 +23,8 @@ class MockVideoProvider(MockJobBase):
         fault_plan: MockFaultPlan | None = None,
         ids: Ids | None = None,
         poll_ticks: int | None = None,
+        fps_override: int | None = None,
+        duration_offset_s: float = 0.0,
     ) -> None:
         super().__init__(
             ledger_path=ledger_path, fault_plan=fault_plan, ids=ids, poll_ticks=poll_ticks
@@ -30,6 +32,10 @@ class MockVideoProvider(MockJobBase):
         self.width_16x9 = width_16x9
         self.height_16x9 = height_16x9
         self.fps = fps
+        # Test-only variants (§F): exercise the S10 conform path with a
+        # wrong-fps or slightly-off-duration raw clip. Defaults are exact.
+        self.fps_override = fps_override
+        self.duration_offset_s = float(duration_offset_s)
 
     async def fetch(self, handle):  # type: ignore[no-untyped-def]
         from studio.providers.base import MediaPayload
@@ -45,14 +51,16 @@ class MockVideoProvider(MockJobBase):
                 width, height = aspect_dimensions(
                     aspect, width_16x9=self.width_16x9, height_16x9=self.height_16x9
                 )
-                duration_s = float(job.get("duration_s") or 5.0)
+                duration_s = float(job.get("duration_s") or 5.0) + self.duration_offset_s
+                duration_s = max(0.1, duration_s)
+                fps = self.fps_override or self.fps
                 await run_ffmpeg(
                     [
                         "-y",
                         "-f",
                         "lavfi",
                         "-i",
-                        f"testsrc2=size={width}x{height}:rate={self.fps}:duration={duration_s:.3f}",
+                        f"testsrc2=size={width}x{height}:rate={fps}:duration={duration_s:.3f}",
                         "-c:v",
                         "libx264",
                         "-pix_fmt",

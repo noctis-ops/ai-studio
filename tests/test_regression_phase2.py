@@ -35,7 +35,8 @@ def test_sandbox_resolves_fully_and_subset_resolves_draft(tmp_path, monkeypatch)
     full = config.registry.resolve_profile("sandbox")
     assert set(full.model_keys)  # demo roles all resolve (mock.*)
     subset = config.registry.resolve_llm_subset("draft")
-    assert subset.model_keys["llm_creative"] == "llm.light"
+    # H4: draft creative is llm.creative (Finding #8).
+    assert subset.model_keys["llm_creative"] == "llm.creative"
     assert subset.model_keys["llm_light"] == "llm.light"
 
 
@@ -57,7 +58,7 @@ def test_begin_prompt_untouched():
 
     git = shutil.which("git")
     assert git, "git must be on PATH for this check"
-    out = subprocess.run(  # noqa: S603 - argv is fixed; no untrusted input
+    out = subprocess.run(
         [git, "diff", "--name-only", "main", "--", "BEGIN_PROMPT.md"],
         cwd=REPO_ROOT, capture_output=True, text=True, check=False,
     )

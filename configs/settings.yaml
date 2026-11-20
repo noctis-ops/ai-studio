@@ -16,7 +16,7 @@ budgets:
   global_cap_usd: null
   warn_pct: 80
 pricing: {llm_tokens_per_char_worst_case: 0.5}   # conservative for Arabic when estimating input tokens
-mock: {tts_chars_per_second: 15, video_width_16x9: 480, video_height_16x9: 270, fps: 24,
+mock: {tts_chars_per_second: 15, video_width_16x9: 960, video_height_16x9: 540, fps: 24,
        poll_ticks: 2}
 retention: {keep_raw_clips_days: 30, keep_narration_audio_days: 30}
 text_pipeline: {context_token_budget: 6000, tashkeel_retry: 1, s4_after_g1: true}
@@ -73,3 +73,29 @@ audio:
     sidechain: {threshold: 0.05, ratio: 8, attack_ms: 20, release_ms: 350, makeup: 1}
   master: {target_lufs: -14, true_peak_db: -1.5, lra: 11, lufs_tolerance: 1.0, tp_ceiling_db: -1.0, clip_peak_db: -0.1}
   qc: {min_duck_db: 8, min_speech_to_music_db: 10, silent_line_rms_db: -45, window_ms: 100, exclude_onset_ms: 150}
+
+# ---- Phase 4: media (fal.ai), visual QC, prompt sanitizer ----
+# Every ⚠ value is an unverified starting point calibrated by the audition/smoke runs.
+fal: {queue_base_url: "https://queue.fal.run", key_env: FAL_KEY,
+      request_timeout_s: 60, download_timeout_s: 120, download_retries: 3}
+media:
+  poll: {initial_s: 3, max_s: 15, backoff: 1.5, max_wait_s: 900}
+  max_paid_attempts_per_shot: 4
+  circuit_breaker_consecutive_failures: 3
+  failed_job_billing: charge            # charge | free  ⚠ unverified how fal bills failed/flagged jobs
+  assumed_retry_rate: {image: 0.25, video: 0.30}
+  ref_max_side_px: 1024
+  ref_jpeg_quality: 90
+  max_inline_bytes: 8000000
+  refs_overflow: primary_only           # primary_only | fail
+  chain_mode: "off"                    # last_frame raises ConfigError before Phase 5
+  clip: {duration_tolerance_ms: 500, conform_crf: 14, strip_audio: true}
+  qc:
+    image: {min_short_side_px: 512, aspect_tolerance_pct: 2.0, min_bytes: 5000,
+            min_luma_mean: 8, min_luma_stddev: 3.0, auto_retries: 2}
+    video: {aspect_tolerance_pct: 2.0, min_bytes: 20000, black_fail_ratio: 0.15,
+            black_pic_th: 0.98, black_min_d_s: 0.1, freeze_warn_ratio: 0.5,
+            freeze_fail_ratio: 0.85, first_frame_black_luma: 8,
+            first_frame_ssim_warn: 0.6, first_frame_ssim_fail: 0.0, auto_retries: 1}
+character_sheets: {roles: [ref_full], aspect: "9:16"}
+sanitizer: {max_levels: 2, model_key: llm.light, max_scene_chars: 600}

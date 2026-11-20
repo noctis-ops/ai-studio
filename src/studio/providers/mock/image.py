@@ -43,15 +43,19 @@ class MockImageProvider(MockJobBase):
                 width, height = aspect_dimensions(
                     aspect, width_16x9=self.width_16x9, height_16x9=self.height_16x9
                 )
-                seed = job.get("seed") or 0
-                color = f"0x{seed & 0xFFFFFF:06x}"
+                seed = int(job.get("seed") or 0)
+                # testsrc2 seeded by a frame offset: high luma stddev (QC-safe),
+                # deterministic per (aspect, seed).
+                offset = seed % 50
                 await run_ffmpeg(
                     [
                         "-y",
                         "-f",
                         "lavfi",
                         "-i",
-                        f"color=c={color}:s={width}x{height}",
+                        f"testsrc2=size={width}x{height}:rate=24",
+                        "-vf",
+                        f"select=eq(n\\,{offset})",
                         "-frames:v",
                         "1",
                         "-bitexact",

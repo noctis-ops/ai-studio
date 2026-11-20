@@ -1,0 +1,3 @@
+Cinematic still frame for an animated short film. Match the series style exactly.
+Full prompt composition is deterministic; see media/prompts.py. This file's
+bytes are part of the media prompt-version sha.

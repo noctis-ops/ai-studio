@@ -5,16 +5,31 @@ in-flight provider work lazily (H6 step 2). Every recovery action is audited.
 from __future__ import annotations
 
 from datetime import timedelta
+from typing import TYPE_CHECKING
 
 from studio.core.clock import Clock, format_ts
 from studio.db.connection import Database
 from studio.db.repos import StudioRepos
 from studio.domain.enums import RunStatus
 
+if TYPE_CHECKING:
+    from studio.pipeline.dag import Dag
 
-def enqueue_pending_stage_runs(repos: StudioRepos) -> int:
+
+def enqueue_pending_stage_runs(repos: StudioRepos, dag: Dag | None = None) -> int:
     """Enqueue `run_stage` jobs for every pending stage_run of a live run that
-    does not already have a queued/running job. Idempotent via dedupe_key."""
+    does not already have a queued/running job. Idempotent via dedupe_key.
+
+    When `dag` is provided, a pending row is only re-enqueued if its
+    dependencies (transitively) are complete — a worker restart must not
+    release rows whose ancestors are still pending (Phase 4: the stale-run
+    cascade re-pends the whole suffix; sweeping it into one concurrent batch
+    executed demo_finalize before s8/s10 re-registered and failed the run).
+    Workers pass their engine's DAG; callers without a DAG keep the legacy
+    sweep-everything behavior.
+    """
+    from studio.pipeline.deps import direct_deps_complete
+
     enqueued = 0
     live_stage_runs = repos.jobs.running_stage_run_ids()
     for run_status in (RunStatus.RUNNING.value, RunStatus.AWAITING_APPROVAL.value):
@@ -23,6 +38,8 @@ def enqueue_pending_stage_runs(repos: StudioRepos) -> int:
                 if row.status != "pending":
                     continue
                 if row.id in live_stage_runs:
+                    continue
+                if dag is not None and not direct_deps_complete(repos, dag, run.id, row.stage):
                     continue
                 job = repos.jobs.enqueue(
                     kind="run_stage",
@@ -114,8 +131,13 @@ def recover(
     repos: StudioRepos,
     clock: Clock,
     stale_after_s: float,
+    dag: Dag | None = None,
 ) -> None:
-    """Full recovery pass run at worker start (and usable from the CLI)."""
+    """Full recovery pass run at worker start (and usable from the CLI).
+
+    `dag` (optional) lets the pending-row sweep respect dependency order;
+    workers pass their engine's DAG. Omitting it preserves the legacy sweep.
+    """
     recover_stale_jobs(db, repos, clock, stale_after_s)
     recover_stage_runs(db, repos, clock)
-    enqueue_pending_stage_runs(repos)
+    enqueue_pending_stage_runs(repos, dag=dag)

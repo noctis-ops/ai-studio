@@ -62,7 +62,12 @@ class ProvidersRepo(Protocol):
     ) -> None: ...
 
     def mark_submitted(
-        self, call_id: str, remote_request_id: str, *, conn: sqlite3.Connection | None = None
+        self,
+        call_id: str,
+        remote_request_id: str,
+        remote_handle_json: str | None = None,
+        *,
+        conn: sqlite3.Connection | None = None,
     ) -> None: ...
 
     def set_remote_request_id(self, call_id: str, remote_request_id: str) -> None: ...
@@ -203,14 +208,19 @@ class SqliteProvidersRepo(SqliteRepo):
         )
 
     def mark_submitted(
-        self, call_id: str, remote_request_id: str, *, conn: sqlite3.Connection | None = None
+        self,
+        call_id: str,
+        remote_request_id: str,
+        remote_handle_json: str | None = None,
+        *,
+        conn: sqlite3.Connection | None = None,
     ) -> None:
         target = conn if conn is not None else self.db.connect()
         now = self._now()
         target.execute(
-            "UPDATE provider_calls SET remote_request_id = ?, status = 'submitted', updated_at = ? "
-            "WHERE id = ?",
-            (remote_request_id, now, call_id),
+            "UPDATE provider_calls SET remote_request_id = ?, remote_handle_json = ?, "
+            "status = 'submitted', updated_at = ? WHERE id = ?",
+            (remote_request_id, remote_handle_json, now, call_id),
         )
 
     def bump_attempt(self, call_id: str) -> None:

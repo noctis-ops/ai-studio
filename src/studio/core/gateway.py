@@ -33,6 +33,7 @@ import logging
 import random
 import tempfile
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -56,6 +57,10 @@ from studio.db.repos.assets import SqliteAssetsRepo
 from studio.db.repos.providers import NewCacheEntry, NewCall, SqliteProvidersRepo
 from studio.domain.enums import ErrorClass
 from studio.domain.errors import (
+    ContentPolicyError,
+    GateNotCleared,
+    JobPendingTimeoutError,
+    MediaJobFailedError,
     PermanentProviderError,
     PolicyRefusalError,
     ProviderError,
@@ -89,12 +94,21 @@ _ASSET_KIND = {"llm": "asset", "tts": "audio", "image": "image", "video": "video
 CallKind = Literal["llm", "tts", "image", "video"]
 
 
+#: H0 second guard. The engine clears this only after assert_gates_cleared()
+#: succeeds for a paid stage; audition/smoke CLIs set an explicit gate_exempt.
+GATE_CLEARED_VAR: ContextVar[bool] = ContextVar("studio_gate_cleared", default=True)
+
+
 @dataclass(frozen=True)
 class CallContext:
     episode_id: str | None
     stage_run_id: str | None
     nonce: str = "0"
     purpose: str = ""
+    # False means "no ancestor gate proof"; audition/smoke paths set
+    # gate_exempt instead. Defaults preserve every Phase 1-3 caller.
+    gate_cleared: bool = True
+    gate_exempt: str | None = None
 
 
 @dataclass(frozen=True)
@@ -194,6 +208,31 @@ class ProviderGateway:
             if hit is not None:
                 return hit
 
+        # -- H0: gate barrier inside the gateway (defense in depth) --------
+        # Cache hits are free and always allowed. Non-cached TTS/image/video
+        # calls require either an approved-ancestor-gate context or an
+        # explicit, audited gate exemption (audition/smoke CLIs).
+        if kind in ("tts", "image", "video"):
+            if ctx.gate_exempt is not None:
+                await asyncio.to_thread(
+                    self.ledger.audit.append,
+                    actor="gateway",
+                    entity=f"run:{ctx.stage_run_id or 'cli'}",
+                    event="gate_exempt_call",
+                    payload={
+                        "kind": kind,
+                        "model_key": model_key,
+                        "purpose": ctx.purpose,
+                        "exempt": ctx.gate_exempt,
+                        "cache_key": cache_key,
+                    },
+                )
+            elif not (ctx.gate_cleared and GATE_CLEARED_VAR.get()):
+                raise GateNotCleared(
+                    f"refusing non-cached {kind} call for {ctx.purpose!r}: "
+                    "ancestor gates are not cleared"
+                )
+
         # -- step 2: adopt in-flight work ----------------------------------
         est = estimate_cost_musd(
             entry,
@@ -214,6 +253,7 @@ class ProviderGateway:
                 call_id=submitted.id,
                 est=submitted.est_cost_musd,
                 remote_request_id=submitted.remote_request_id,
+                remote_handle_json=submitted.remote_handle_json,
                 already_submitted=True,
             )
 
@@ -267,6 +307,7 @@ class ProviderGateway:
             call_id=call_id,
             est=est,
             remote_request_id=None,
+            remote_handle_json=None,
             already_submitted=False,
         )
 
@@ -281,7 +322,8 @@ class ProviderGateway:
         call_id: str,
         est: int,
         remote_request_id: str | None,
-        already_submitted: bool,
+        remote_handle_json: str | None = None,
+        already_submitted: bool = False,
     ) -> GatewayResult:
         """Steps 4-8. Any exception here releases the reservation via fail_call."""
         provider = await asyncio.to_thread(self._provider_for, model_key, entry)
@@ -289,7 +331,17 @@ class ProviderGateway:
         try:
             if job_based:
                 if already_submitted:
-                    handle = JobHandle(remote_request_id=str(remote_request_id))
+                    # Resume: the four URLs were persisted with the remote id
+                    # in ONE statement, so polling never reconstructs them.
+                    meta: dict[str, Any] = {}
+                    if remote_handle_json:
+                        try:
+                            parsed_meta = json.loads(remote_handle_json)
+                            if isinstance(parsed_meta, dict):
+                                meta = parsed_meta
+                        except json.JSONDecodeError:
+                            meta = {}
+                    handle = JobHandle(remote_request_id=str(remote_request_id), meta=meta)
                 else:
                     limiter = self._limiter(entry.provider, entry)
                     async with limiter:
@@ -309,6 +361,10 @@ class ProviderGateway:
             async with limiter:
                 result = await self._submit_single(call_id, kind, provider, req)
             return await self._finish_single(kind, call_id, est, entry, req, result)
+        except JobPendingTimeoutError:
+            # Keep the call row `submitted` (remote handle persisted); the
+            # next attempt adopts it and resumes polling — zero re-submits.
+            raise
         except Exception as exc:
             await asyncio.to_thread(self._fail_from_exception, call_id, est, exc)
             raise
@@ -343,9 +399,14 @@ class ProviderGateway:
             rng=self._rng,
         )
         self.faults.crash_at("after_submit_before_persist")
-        # Persist remote id + submitted status in ONE statement.
+        # Persist remote id + the whole fal handle (status/response/cancel
+        # URLs) + submitted status in ONE statement.
+        handle_json = json.dumps(handle.meta, sort_keys=True, separators=(",", ":"))
         await asyncio.to_thread(
-            self._providers_repo.mark_submitted, call_id, handle.remote_request_id
+            self._providers_repo.mark_submitted,
+            call_id,
+            handle.remote_request_id,
+            handle_json,
         )
         self.faults.crash_at("after_persist_id")
         return handle
@@ -389,7 +450,13 @@ class ProviderGateway:
 
     async def _poll_until_done(self, provider: Any, handle: JobHandle) -> None:
         first = True
-        for _ in range(self._max_polls):
+        # Phase 4 §F: job providers may declare their own poll cadence
+        # (fal uses media.poll); backoff grows exponentially to its cap.
+        poll_cfg = self.settings.media.poll
+        interval = float(getattr(provider, "poll_interval_s", self._poll_interval_s))
+        backoff = float(poll_cfg.backoff)
+        max_interval = float(poll_cfg.max_s)
+        for poll_index in range(self._max_polls):
             if first:
                 # Crash after all persistence but before the first poll.
                 self.faults.crash_at("during_poll")
@@ -418,9 +485,13 @@ class ProviderGateway:
                     ErrorClass.PERMANENT: PermanentProviderError,
                 }
                 raise mapping[error_class](message)
-            await self._sleep(self._poll_interval_s)
-        raise PermanentProviderError(
-            f"provider job {handle.remote_request_id} did not finish after {self._max_polls} polls"
+            await self._sleep(min(max_interval, interval * (backoff**poll_index)))
+        # §F: a poll timeout must not fail or cancel the job. The call stays
+        # `submitted` with its remote handle persisted; the engine requeues
+        # the stage job (Transient) and resume polls the same request id.
+        raise JobPendingTimeoutError(
+            f"provider job {handle.remote_request_id} did not finish after "
+            f"{self._max_polls} polls; leaving it submitted for resume"
         )
 
     async def _fetch_and_store(
@@ -517,7 +588,15 @@ class ProviderGateway:
         return tmp, tmp
 
     def _fail_from_exception(self, call_id: str, est: int, exc: BaseException) -> None:
-        settle = est if isinstance(exc, ZeroByteAssetError) else 0
+        # Phase 4 cost settlement: zero-byte assets and accepted-but-flagged
+        # fal jobs are billed; uncharged policy refusals release the reserve.
+        settle = 0
+        if isinstance(exc, ZeroByteAssetError):
+            settle = est
+        elif isinstance(exc, ContentPolicyError):
+            settle = est if exc.billed else 0
+        elif isinstance(exc, MediaJobFailedError):
+            settle = 0 if self.settings.media.failed_job_billing == "free" else est
         error_class = (
             exc.error_class.value if isinstance(exc, ProviderError) else ErrorClass.PERMANENT.value
         )

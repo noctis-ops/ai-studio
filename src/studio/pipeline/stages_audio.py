@@ -64,7 +64,7 @@ from studio.audio.mastering import master_two_pass
 from studio.audio.mixer import DuckSpec, cues_from_rows, render_premaster
 from studio.audio.plan import plan_audio, scene_pieces
 from studio.audio.stem import build_narration_stem
-from studio.audio.timeline import build_timeline
+from studio.audio.timeline import build_timeline, choose_supported_duration_ms
 from studio.audio.voice import (
     parse_voice_settings,
     request_settings,
@@ -766,6 +766,9 @@ class TimingReconcilerHandler:
                     "tail_ms": settings.timing.tail_ms,
                 },
                 "supported_durations_s": self._supported_durations(ctx),
+                # §J: changing the video model must stale S6, not silently
+                # reuse a locked duration from a different endpoint.
+                "video_model_key": ctx.resolved_profile.model_key_for("video"),
             }
         )
 
@@ -872,22 +875,12 @@ class TimingReconcilerHandler:
             def capacity_stretch(frames: int, *, hold: int = max_hold_frames) -> int:
                 return math.ceil(frames * float(timing.max_stretch)) + hold
 
-            plain: int | None = None
-            squeeze: int | None = None
-            for duration_ms, clip_frames in zip(supported_ms, supported_frames, strict=True):
-                if need_frames <= clip_frames:
-                    plain = duration_ms
-                    break
-            if timing.prefer_stretch_to_save_cost:
-                for duration_ms, clip_frames in zip(supported_ms, supported_frames, strict=True):
-                    if need_frames <= capacity_stretch(clip_frames):
-                        squeeze = duration_ms
-                        break
-            chosen: int | None
-            if squeeze is not None and (plain is None or squeeze < plain):
-                chosen = squeeze
-            else:
-                chosen = plain
+            chosen = choose_supported_duration_ms(
+                needed_frames=need_frames,
+                supported_durations_s=durations,
+                fps=fps,
+                timing=timing,
+            )
 
             if chosen is None:
                 max_clip_frames = supported_frames[-1]

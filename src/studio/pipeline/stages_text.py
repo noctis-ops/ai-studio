@@ -61,6 +61,7 @@ from studio.pipeline.bible_pack import (
     episode_summary_from_row,
     pack_context,
 )
+from studio.pipeline.estimate_media import media_estimate, media_estimate_sha
 from studio.pipeline.stage import StageOutput, StageSpec
 from studio.providers.base import LLMRequest
 
@@ -828,6 +829,8 @@ class MetadataSafetyHandler:
                 "schema": _METADATA_SCHEMA,
                 "pack": pack.pack_sha256,
                 "director": director_sha,
+                # H2: registry prices/settings are part of the decision input.
+                "media_estimate": media_estimate_sha(ctx),
             }
         )
 
@@ -872,15 +875,16 @@ class MetadataSafetyHandler:
             metadata_json=metadata_json,
             safety_status=metadata["safety"],
         )
-        return StageOutput(
-            output={
-                "deliverable_id": deliverable.id,
-                "language": deliverable.language,
-                "safety": metadata["safety"],
-                "title": metadata["title"],
-                "tags": metadata["tags"],
-            }
-        )
+        estimate = media_estimate(ctx, deliverable.id)
+        output: dict[str, Any] = {
+            "deliverable_id": deliverable.id,
+            "language": deliverable.language,
+            "safety": metadata["safety"],
+            "title": metadata["title"],
+            "tags": metadata["tags"],
+        }
+        output.update(estimate.additive_output())
+        return StageOutput(output=output)
 
 
 def _parse_metadata(parsed: Any) -> dict[str, Any]:

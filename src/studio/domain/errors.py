@@ -141,3 +141,63 @@ class AudioQcError(StudioError):
 
 class AudioPlanError(StudioError):
     """The audio plan (S7) could not be built deterministically."""
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 (media) errors
+# ---------------------------------------------------------------------------
+
+
+class GateNotCleared(StudioError):
+    """H0: a paid stage tried to run with an uncleared ancestor gate."""
+
+
+class MediaConfigError(ConfigError):
+    """Invalid/unverified media model, aspect, duration or chain config."""
+
+
+class ContentPolicyError(PolicyRefusalError):
+    """fal returned a policy refusal / NSFW flag.
+
+    ``billed=False`` means the provider did not charge (release the
+    reservation); ``billed=True`` means the job was accepted and charged
+    (settle in full). Never store an asset for a billed refusal.
+    """
+
+    error_class = ErrorClass.POLICY
+
+    def __init__(self, message: str, *, billed: bool) -> None:
+        super().__init__(message)
+        self.billed = billed
+
+
+class JobPendingTimeoutError(TransientProviderError):
+    """Poll exhaustion for a remote job that stays alive.
+
+    The remote job may still be running and will bill; the call row must
+    stay ``submitted`` so a later attempt adopts it (zero re-submits).
+    """
+
+
+class MediaJobFailedError(PermanentProviderError):
+    """A fal job reached a failed state after acceptance.
+
+    Settlement follows ``media.failed_job_billing`` (charge | free); the
+    default is the conservative ``charge``.
+    """
+
+
+class MediaCircuitOpen(StudioError):
+    """Too many consecutive shot failures; stop the stage before burning money."""
+
+
+class MediaAttemptExhausted(StudioError):
+    """``max_paid_attempts_per_shot`` reached without an accepted attempt."""
+
+
+class VisualQcError(StudioError):
+    """A non-retryable visual QC failure (aspect, resolution, duration ...)."""
+
+
+class FailedPolicy(StudioError):
+    """Sanitizer exhausted ``max_levels``; the shot parks for a human."""

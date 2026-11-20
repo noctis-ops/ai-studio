@@ -59,7 +59,7 @@ class Worker:
     ) -> int:
         """Run until `until_idle` and the queue is drained, or `max_jobs`
         jobs were executed. Returns the number of jobs executed."""
-        recover(self.db, self.repos, self.clock, self._stale_after_s)
+        recover(self.db, self.repos, self.clock, self._stale_after_s, dag=self.engine.dag)
         completed = 0
         idle_polls = 0
         inflight: set[asyncio.Task[None]] = set()
