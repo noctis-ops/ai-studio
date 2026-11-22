@@ -177,8 +177,16 @@ class GateService:
         gate_id: str,
         note: str | None,
         rejections: list[ShotRejection],
+        *,
+        deliverable_id: str | None = None,
     ) -> GateRow:
-        if not rejections:
+        """Reject a gate.
+
+        Shot rejections re-run the paid stage for exactly those shots (G2).
+        A ``deliverable_id`` rejects a *render* (G3): the assembly and QC rerun
+        for that deliverable only, which is free and produces a new render sha.
+        """
+        if not rejections and deliverable_id is None:
             raise GatePolicyError("request_changes requires at least one rejected item")
         gate = self._pending_gate(gate_id)
         if gate.stage == _SHEETS_STAGE:
@@ -191,6 +199,15 @@ class GateService:
         reject_stage = spec.gate_reject_stage or gate.stage
         downstream = sorted(self.dag.downstream(reject_stage))
         stages_to_stale = {reject_stage, *downstream}
+        if deliverable_id is not None:
+            anchor = SubjectRef(scope=Scope.DELIVERABLE, id=deliverable_id)
+            for row in self.repos.pipeline.list_stage_runs(gate.run_id):
+                if row.stage not in stages_to_stale:
+                    continue
+                if row.status not in ("succeeded", "pending", "running", "stale"):
+                    continue
+                if subjects_related(anchor, subject_from_stage_run(row)):
+                    affected.append(row.id)
         for rejection in rejections:
             shot = self.repos.content.get_shot(rejection.shot_id)
             if shot is None:
@@ -232,6 +249,7 @@ class GateService:
                 "gate": gate.gate,
                 "round": gate.round,
                 "note": note,
+                "deliverable_id": deliverable_id,
                 "rejections": [
                     {"shot_id": r.shot_id, "edited_prompt": r.edited_prompt} for r in rejections
                 ],

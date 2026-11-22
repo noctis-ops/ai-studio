@@ -314,10 +314,18 @@ async def run_to_g2(env) -> None:
 
 
 async def run_to_s10(env) -> None:
-    """Drain the full production chain to completion."""
+    """Drain the full production chain to completion.
+
+    Phase 5: the chain now ends with S11 (assemble) and S12 (render QC), and
+    S12 parks at G3. The helper approves the final cut with a sandbox checklist
+    (every item "auto"-marked) so callers still reach a completed run.
+    """
     await run_to_g2(env)
     approve_parked(env, "G2_KEYFRAMES", note="keyframes approved")
     await drain(env)
+    if pending_gates(env, "G3_FINAL_CUT"):
+        approve_parked(env, "G3_FINAL_CUT", note="final cut approved")
+        await drain(env)
 
 
 def stage_outputs(env, stage: str) -> list[dict]:

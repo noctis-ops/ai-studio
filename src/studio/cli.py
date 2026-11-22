@@ -59,6 +59,11 @@ app.add_typer(tts_app, name="tts")
 app.add_typer(audio_app, name="audio")
 encode_app = typer.Typer(help="Encoder utilities (probe).")
 app.add_typer(encode_app, name="encode")
+render_app = typer.Typer(
+    help="Final render utilities (rebuild is free: it never re-pays a provider).",
+    no_args_is_help=True,
+)
+app.add_typer(render_app, name="render")
 
 console = Console()
 err_console = Console(stderr=True)
@@ -90,6 +95,45 @@ def _run_async(coro: Coroutine[Any, Any, T]) -> T:
 def _fail(message: str) -> NoReturn:
     err_console.print(f"[red]error:[/red] {message}")
     raise typer.Exit(code=1)
+
+
+def _deliverable_by_key(
+    repos: StudioRepos, run: Any, key: str
+) -> str | None:
+    """Resolve a deliverable by id, language code or channel id."""
+    episode_id = getattr(run, "episode_id", None)
+    if not episode_id:
+        return None
+    deliverables = repos.content.list_deliverables(episode_id)
+    for row in deliverables:
+        if row.id == key:
+            return row.id
+    for row in deliverables:
+        if row.language == key:
+            return row.id
+    for row in deliverables:
+        if row.channel_id == key:
+            return row.id
+    return None
+
+
+def _flag_present(name: str) -> bool:
+    """True when ``name`` was passed on the command line (typer default aside)."""
+    return any(arg == name or arg.startswith(f"{name}=") for arg in sys.argv[1:])
+
+
+def _render_rows(repos: StudioRepos, run_id: str, deliverable_id: str | None) -> list[str]:
+    """Stage-run ids for S11/S12 of ``deliverable_id`` (or every deliverable)."""
+    out: list[str] = []
+    for row in repos.pipeline.list_stage_runs(run_id):
+        if row.stage not in ("s11_assemble", "s12_render_qc"):
+            continue
+        if row.subject_scope != "deliverable":
+            continue
+        if deliverable_id is not None and row.subject_id != deliverable_id:
+            continue
+        out.append(row.id)
+    return out
 
 
 # ==================================================================
@@ -670,6 +714,42 @@ def doctor(
             detail = f"probe failed: {exc}"
     checks.append(("NVENC h264 probe (informational)", nvenc, detail))
 
+    # Phase 5 §D: which encoder S11 will actually use, and why. Informational
+    # only — a fallback to x264 is a valid outcome, never a failed doctor.
+    if ffmpeg:
+        try:
+            from studio.video.encoders import SubprocessProbeRunner, driver_string
+            from studio.video.encoders import resolve_encoder as _resolve_encoder
+            from studio.video.ffmpeg import ffmpeg_version as _ffmpeg_version
+
+            settings = load_all(_home()).settings
+            resolution = asyncio.run(
+                _resolve_encoder(
+                    settings,
+                    SubprocessProbeRunner(),
+                    geometries=[(settings.render.fps, settings.render.fps)],
+                    cache_path=Path(settings.paths.home)
+                    / settings.encode.probe.cache_file,
+                    ffmpeg_version=".".join(str(p) for p in asyncio.run(_ffmpeg_version())),
+                    driver=driver_string(),
+                )
+            )
+            checks.append(
+                (
+                    "encoder selection (Phase 5)",
+                    "INFO",
+                    f"{resolution.profile.name} ({resolution.reason})",
+                )
+            )
+        except Exception as exc:
+            checks.append(
+                (
+                    "encoder selection (Phase 5)",
+                    "WARN",
+                    f"could not resolve: {str(exc)[:160]}",
+                )
+            )
+
     home = _home()
     try:
         probe_dir = home / "data"
@@ -1027,13 +1107,99 @@ def gates_list(run_id: str | None = typer.Option(None, "--run", help="Filter by 
 def gates_approve(
     gate_id: str = typer.Argument(...),
     note: str | None = typer.Option(None, "--note"),
+    checklist_file: str | None = typer.Option(
+        None, "--checklist-file", help="JSON file with the G3 audience checklist."
+    ),
+    reviewed_full_render: bool | None = typer.Option(
+        None, "--reviewed-full-render", help="G3: I watched the whole render."
+    ),
+    made_for_kids: bool | None = typer.Option(
+        None, "--made-for-kids/--not-made-for-kids",
+        help="G3: audience declaration (required in the final profile).",
+    ),
+    ai_disclosure: bool = typer.Option(
+        True, "--ai-disclosure/--no-ai-disclosure", help="G3: AI disclosure."
+    ),
+    third_party_ip: bool | None = typer.Option(
+        None, "--third-party-ip/--no-third-party-ip",
+        help="G3: third-party IP confirmed clear.",
+    ),
+    licenses: bool | None = typer.Option(
+        None, "--licenses/--no-licenses", help="G3: every cue is licensed."
+    ),
 ) -> None:
-    """Approve a pending gate; the run continues."""
+    """Approve a pending gate; the run continues.
+
+    A G3 (final cut) approval must carry the audience checklist: either
+    `--checklist-file checklist.json` or the individual flags. In the final
+    profile every item is mandatory and machine-filled values are refused.
+    """
     _, _, clock, ids, repos = _connect()
     dag = _dag_for_gate(repos, gate_id)
     service = GateService(_, repos, clock, dag, ids)
+    checklist: dict[str, object] | None = None
+    gate_row = repos.gates.get(gate_id)
+    is_g3 = gate_row is not None and gate_row.gate == "G3_FINAL_CUT"
+    if checklist_file is not None and not is_g3:
+        _fail("--checklist-file only applies to a G3_FINAL_CUT gate")
+    if checklist_file is not None:
+        checklist_path = Path(checklist_file)
+        try:
+            loaded = json.loads(checklist_path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            _fail(f"cannot read {checklist_path}: {exc}")
+        except ValueError as exc:
+            _fail(f"{checklist_path} is not valid JSON: {exc}")
+        if not isinstance(loaded, dict):
+            _fail(f"{checklist_path} must contain a JSON object")
+        checklist = {str(k): v for k, v in loaded.items()}
+    flag_values_given = any(
+        value is not None
+        for value in (
+            reviewed_full_render,
+            made_for_kids,
+            third_party_ip,
+            licenses,
+        )
+    )
+    flag_values: dict[str, object] = {
+        "reviewed_full_render": reviewed_full_render,
+        "audience_made_for_kids": made_for_kids,
+        "third_party_ip_confirmed": third_party_ip,
+        "licenses_confirmed": licenses,
+    }
+    if is_g3:
+        merged = dict(checklist or {})
+        for key, value in flag_values.items():
+            if value is not None:
+                merged[key] = value
+        disclosure_given = "--no-ai-disclosure" in sys.argv or _flag_present(
+            "--ai-disclosure"
+        )
+        if disclosure_given:
+            merged["ai_disclosure"] = ai_disclosure
+        profile = "final"
+        if gate_row is not None:
+            run_row = repos.pipeline.get_run(gate_row.run_id)
+            profile = run_row.profile if run_row is not None else "final"
+        if (
+            profile == "final"
+            and checklist_file is None
+            and not any(value is not None for value in flag_values.values())
+            and not disclosure_given
+        ):
+            _fail(
+                "a final G3 approval needs the audience checklist: pass "
+                "--checklist-file checklist.json or the individual flags"
+            )
+        if profile != "final" and checklist_file is None and not flag_values_given:
+            # Sandbox/draft: omitted items are stored as `"auto"` markers, which
+            # S13 and the final profile both refuse later.
+            checklist = None
+        else:
+            checklist = dict(merged)
     try:
-        service.approve(gate_id, note)
+        service.approve(gate_id, note, checklist=checklist)
     except StudioError as exc:
         _fail(str(exc))
     _hint = " --production" if _is_text_gate(repos, gate_id) else ""
@@ -1052,11 +1218,17 @@ def gates_reject(
     note: str | None = typer.Option(None, "--note"),
     reason: str | None = typer.Option(None, "--reason", help="Alias of --note."),
     yes: bool = typer.Option(False, "--yes", help="Confirm the paid regeneration."),
+    deliverable: str | None = typer.Option(
+        None, "--deliverable", help="G3: reject this deliverable's render (free rebuild)."
+    ),
 ) -> None:
     """Reject output at a gate; the stage re-executes.
 
     G2 accepts shot numbers (`--shots 3,7`) or `--all`; both show the expected
     keyframe cost and require `--yes`, because only those shots are re-paid.
+
+    G3 takes `--deliverable KEY --reason ...`: it re-runs the *free* assembly
+    and QC for that deliverable, so the next G3 round binds to a new render sha.
     """
     config, db, clock, ids, repos = _connect()
     dag = _dag_for_gate(repos, gate_id)
@@ -1100,10 +1272,25 @@ def gates_reject(
             ShotRejection(shot_id=row.id, edited_prompt=prompt) for row in targets
         )
         _ = gate_panel  # panel is what `gates show` renders from the same context
-    if not rejections:
-        _fail("nothing to reject: pass --shot <id>, --shots 3,7 or --all")
+    if deliverable is not None:
+        gate = repos.gates.get(gate_id)
+        if gate is None or gate.gate != "G3_FINAL_CUT":
+            _fail("--deliverable only applies to a G3_FINAL_CUT gate")
+        run = repos.pipeline.get_run(gate.run_id)
+        if run is None:
+            _fail(f"gate {gate_id} has no run")
+        resolved = _deliverable_by_key(repos, run, deliverable)
+        if resolved is None:
+            _fail(f"unknown deliverable {deliverable!r} for run {run.id}")
+        deliverable = resolved
+        if not note:
+            _fail("a G3 rejection needs --reason so the rebuild has a record")
+    if not rejections and deliverable is None:
+        _fail(
+            "nothing to reject: pass --shot <id>, --shots 3,7, --all or --deliverable KEY"
+        )
     try:
-        service.request_changes(gate_id, note, rejections)
+        service.request_changes(gate_id, note, rejections, deliverable_id=deliverable)
     except StudioError as exc:
         _fail(str(exc))
     _hint = " --production" if _is_text_gate(repos, gate_id) else ""
@@ -1133,6 +1320,45 @@ def _reject_shot_rows(  # type: ignore[no-untyped-def]
     if missing:
         _fail(f"unknown shot number(s): {', '.join(str(n) for n in sorted(missing))}")
     return [row for row in rows if row.shot_no in wanted]
+
+
+@render_app.command("rebuild")
+def render_rebuild(
+    run_id: str = typer.Argument(..., help="Run id."),
+    deliverable: str | None = typer.Option(
+        None, "--deliverable", help="Deliverable key (id, language or channel)."
+    ),
+) -> None:
+    """Invalidate S11 + S12 so the free assembly and render QC run again.
+
+    Only the render side is invalidated: conformed clips, the audio master and
+    every gate-input upstream of S11 stay intact, and no provider is called.
+    """
+    _, db, _clock, _ids, repos = _connect()
+    migrate(db)
+    run = repos.pipeline.get_run(run_id)
+    if run is None:
+        _fail(f"unknown run {run_id}")
+    target: str | None = None
+    if deliverable is not None:
+        target = _deliverable_by_key(repos, run, deliverable)
+        if target is None:
+            _fail(f"unknown deliverable {deliverable!r} for run {run_id}")
+    stage_run_ids = _render_rows(repos, run_id, target)
+    if not stage_run_ids:
+        _fail("no S11/S12 stage runs to invalidate")
+    repos.pipeline.mark_stale(stage_run_ids)
+    repos.pipeline.set_run_status(run_id, "running")
+    repos.jobs.enqueue(
+        kind="advance_run",
+        payload={"run_id": run_id},
+        dedupe_key=f"advance:{run_id}",
+    )
+    scope = target or "every deliverable"
+    console.print(
+        f"staled {len(stage_run_ids)} stage run(s) for {scope}; "
+        "next: studio worker --until-idle (free)"
+    )
 
 
 @gates_app.command("show")
@@ -2508,6 +2734,55 @@ def _render_animatic(  # type: ignore[no-untyped-def]
     )
     return "\n".join(parts)
 
+def _render_render_preview(  # type: ignore[no-untyped-def]
+    repos, cas, outdir: Path, run_id: str
+) -> str:
+    """§J: <video> per deliverable plus the measured S12 QC table."""
+    rows = [
+        row
+        for row in repos.pipeline.list_stage_runs(run_id, stage="s12_render_qc")
+        if row.status == "succeeded" and row.output_json
+    ]
+    if not rows:
+        return '<p class="muted">no render QC yet: run S12 (studio worker --until-idle)</p>'
+    parts: list[str] = []
+    for row in rows:
+        output = json.loads(row.output_json or "{}")
+        link = _copy_for_preview(outdir, cas, output.get("render_sha256"))
+        qc_link = _copy_for_preview(outdir, cas, output.get("qc_report_sha256"))
+        preset = output.get("preset") or {}
+        parts.append(
+            f"<h2>deliverable <code>{_escape(str(output.get('deliverable_id')))}</code>"
+            f" · {output.get('frames')} frames · {output.get('fps')} fps · "
+            f"{_escape(str(preset.get('width')))}x{_escape(str(preset.get('height')))}"
+            " · QC <strong style=\"color:"
+            f"{_QC_STYLE.get(str(output.get('qc_status')), '#333')}\">"
+            f"{_escape(str(output.get('qc_status')))}</strong></h2>"
+        )
+        if link:
+            parts.append(
+                '<video controls preload="metadata" width="360" '
+                f'src="{_escape(link)}"></video>'
+            )
+        parts.append(
+            "<table><tr><th>check</th><th>status</th></tr>"
+            + "".join(
+                f"<tr><td>{_escape(str(check.get('name')))}</td><td style=\"color:"
+                f"{_QC_STYLE.get(str(check.get('status')), '#333')}\">"
+                f"{_escape(str(check.get('status')))}</td></tr>"
+                for check in output.get("checks") or []
+                if isinstance(check, dict)
+            )
+            + "</table>"
+        )
+        if qc_link:
+            parts.append(
+                f'<p class="muted">QC report: <a href="{_escape(qc_link)}">'
+                f"{_escape(str(output.get('qc_report_sha256'))[:16])}</a></p>"
+            )
+    return "\n".join(parts)
+
+
 @media_app.command("preview")
 def media_preview(
     run_id: str = typer.Argument(..., help="Run id."),
@@ -2518,8 +2793,11 @@ def media_preview(
     """Write data/previews/<run_id>/<stage>.html (stdlib-only static page)."""
     stages = [stage.strip().lower()] if stage else ["sheets", "keyframes", "clips"]
     for item in stages:
-        if item not in ("sheets", "keyframes", "clips", "animatic"):
-            _fail(f"--stage must be sheets|keyframes|clips|animatic, got {item!r}")
+        if item not in ("sheets", "keyframes", "clips", "animatic", "render"):
+            _fail(
+                "--stage must be sheets|keyframes|clips|animatic|render, "
+                f"got {item!r}"
+            )
 
     config, db, clock, _ids, repos = _connect()
     migrate(db)
@@ -2558,6 +2836,8 @@ def media_preview(
             body_parts.append(_render_attempts(db, cas, outdir, shots, tracks, "keyframe"))
         elif item == "animatic":
             body_parts.append(_render_animatic(db, repos, cas, outdir, run_id, config, clock, _ids))
+        elif item == "render":
+            body_parts.append(_render_render_preview(repos, cas, outdir, run_id))
         else:
             body_parts.append(_render_attempts(db, cas, outdir, shots, tracks, "clip"))
         target = outdir / f"{item}.html"

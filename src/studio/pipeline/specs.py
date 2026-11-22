@@ -23,7 +23,11 @@ from studio.pipeline.stages_audio import (
     TtsLineHandler,
     TtsPreflightHandler,
 )
-from studio.pipeline.stages_render import AnimaticHandler, AssembleHandler
+from studio.pipeline.stages_render import (
+    AnimaticHandler,
+    AssembleHandler,
+    RenderQcHandler,
+)
 from studio.pipeline.stages_text import text_specs
 
 __all__ = ["audio_specs", "media_specs", "production_specs"]
@@ -76,7 +80,7 @@ def audio_specs() -> list[StageSpec]:
 
 
 def media_specs(*, after: tuple[str, ...] = ("s7b_audio_mix",)) -> list[StageSpec]:
-    """S8a (G0) → S8 → S9 (G2) → S10p → S10 → S11, after the audio chain.
+    """S8a (G0) → S8 → S9 (G2) → S10p → S10 → S11 → S12 (G3), after audio.
 
     Phase 5 moved G2 from S8 to S9: the human reviews the *animatic* (real
     stills at real timing over the real master), and rejecting there re-runs
@@ -130,6 +134,17 @@ def media_specs(*, after: tuple[str, ...] = ("s7b_audio_mix",)) -> list[StageSpe
             depends_on=("s10_clips", "s7b_audio_mix"),
             handler=AssembleHandler(),
             gate_after=None,
+            spends_money=False,
+        ),
+        # Gate G3 lives on the render, never on text: rejecting it re-runs the
+        # free assembly (a new render sha) rather than any paid stage.
+        StageSpec(
+            name="s12_render_qc",
+            scope=Scope.DELIVERABLE,
+            depends_on=("s11_assemble",),
+            handler=RenderQcHandler(),
+            gate_after=GateKind.G3_FINAL_CUT,
+            gate_reject_stage="s11_assemble",
             spends_money=False,
         ),
     ]

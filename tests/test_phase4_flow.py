@@ -508,9 +508,15 @@ async def test_eng_15_no_paid_call_before_ancestor_gates(tmp_path, monkeypatch):
     approve_parked(env, "G2_KEYFRAMES", note="keyframes approved")
     await drain(env)
     assert provider_calls(env, capability="image_to_video") != []
+    # Phase 5: the chain ends at S12 and parks at G3 (the final cut).
+    assert pending_gates(env, "G3_FINAL_CUT")
+    video_calls_before_g3 = len(provider_calls(env, capability="image_to_video"))
+    approve_parked(env, "G3_FINAL_CUT", note="final cut approved")
+    await drain(env)
     run = env.repos.pipeline.get_run(env.run_row.id)
     assert run is not None and run.status == "completed"
     assert len(provider_calls(env, capability="image_to_video")) == 3
+    assert video_calls_before_g3 == 3, "render/render QC are free"
 
 
 # ==================================================================

@@ -314,7 +314,19 @@ async def mux_audio(
         "-i", str(audio),
         "-map", "0:v:0",
         "-map", "1:a:0",
+        # `-c:v copy` keeps the segment's colour *matrix* but the MP4 colr atom
+        # is built from these stream options; without them the final render has
+        # an unspecified primaries/transfer pair and S12 fails §J.3.
+        "-color_primaries", "bt709",
+        "-color_trc", "bt709",
+        "-colorspace", "bt709",
+        "-color_range", "tv",
         "-c:v", "copy",
+        # Written into the H.264 VUI (no re-encode), so ffprobe/§J.3 see the
+        # tags on the *muxed* file rather than only on the segment.
+        "-bsf:v",
+        "h264_metadata=colour_primaries=1:transfer_characteristics=1:"
+        "matrix_coefficients=1:video_full_range_flag=0",
         "-c:a", "aac",
         "-b:a", f"{audio_bitrate_k}k",
         "-ar", str(sample_rate),

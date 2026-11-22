@@ -29,6 +29,12 @@ from studio.core.cas import ContentStore
 from studio.domain.enums import Language, Scope
 from studio.domain.errors import ConfigError, MediaToolError, PreflightError
 from studio.domain.refs import SubjectRef
+from studio.pipeline.qc_render import (
+    RENDER_QC_VERSION,
+    run_render_qc,
+    upstream_aggregate,
+    write_qc_report,
+)
 from studio.pipeline.stage import StageOutput
 from studio.video.encoders import (
     ASSEMBLER_VERSION,
@@ -758,5 +764,146 @@ class AssembleHandler:
                 "assembler_version": ASSEMBLE_VERSION,
                 "segment_count": len(parts),
                 "master_sha256": plan.master_sha,
+            }
+        )
+
+
+RENDER_QC_STAGE = "s12_render_qc"
+
+
+def _render_output(ctx: RunContext, deliverable_id: str) -> dict[str, Any]:
+    """The S11 output for this deliverable, or a fail-closed preflight error."""
+    rows = [
+        row
+        for row in ctx.repos.pipeline.list_stage_runs(ctx.run_id, stage=ASSEMBLE_STAGE)
+        if row.status == "succeeded" and row.output_json
+    ]
+    for row in rows:
+        if row.output_json is None:  # pragma: no cover - filtered above
+            continue
+        payload: dict[str, Any] = json.loads(row.output_json)
+        if payload.get("deliverable_id") == deliverable_id:
+            return payload
+    raise PreflightError(
+        f"no successful {ASSEMBLE_STAGE} output for deliverable {deliverable_id}; "
+        "S12 only ever measures the final render"
+    )
+
+
+class RenderQcHandler:
+    """S12: independent QC of the muxed MP4, then gate G3 on that render."""
+
+    _STAGE = RENDER_QC_STAGE
+
+    def subjects(self, ctx: RunContext) -> list[SubjectRef]:
+        return deliverable_subjects(ctx)
+
+    def input_hash(self, ctx: RunContext, subject: SubjectRef) -> str:
+        settings = ctx.config.settings
+        deliverable = ctx.repos.content.get_deliverable(subject.id)
+        assert deliverable is not None
+        try:
+            preset = _deliverable_preset(ctx, deliverable)
+            render = _render_output(ctx, subject.id)
+        except Exception as exc:  # run() reports the real reason
+            return _sha({"stage": self._STAGE, "error": str(exc)})
+        return _sha(
+            {
+                "stage": self._STAGE,
+                "deliverable_id": subject.id,
+                # E3: the G3 snapshot is the render sha plus the QC report sha,
+                # so re-rendering or re-measuring blocks a stale approval.
+                "render_sha256": render.get("render_sha256"),
+                "render_report_sha256": render.get("render_report_sha256"),
+                "preset": {
+                    "aspect": preset.aspect.value,
+                    "width": preset.width,
+                    "height": preset.height,
+                    "fps": preset.fps,
+                    "video": preset.video.model_dump(mode="json"),
+                    "audio": preset.audio.model_dump(mode="json"),
+                },
+                "qc_render": settings.qc.render.model_dump(mode="json"),
+                "av_sync": settings.assemble.av_sync.model_dump(mode="json"),
+                "qc_version": RENDER_QC_VERSION,
+            }
+        )
+
+    async def run(self, ctx: RunContext, subject: SubjectRef) -> StageOutput:
+        settings = ctx.config.settings
+        deliverable = ctx.repos.content.get_deliverable(subject.id)
+        assert deliverable is not None
+        preset = _deliverable_preset(ctx, deliverable)
+        render = _render_output(ctx, subject.id)
+        cas = ContentStore(Path(settings.paths.cas), ctx.db, ctx.clock)
+        render_path = cas.resolve(str(render["render_sha256"]))
+        if not render_path.exists():
+            raise PreflightError(
+                f"render asset {render['render_sha256']} is missing from the CAS; "
+                "re-run S11"
+            )
+        work_dir = (
+            Path(settings.paths.projects)
+            / str(ctx.episode_id)
+            / "work"
+            / f"s12_{subject.id}"
+            / self.input_hash(ctx, subject)[:16]
+        )
+        report = await run_render_qc(
+            render_path,
+            settings=settings,
+            preset=preset,
+            expected_frames=int(render["frames"]),
+            master_sha256=render.get("master_sha256"),
+            upstream=upstream_aggregate(
+                ctx, ctx.run_id, track_id=getattr(deliverable, "track_id", None)
+            ),
+            work_dir=work_dir,
+        )
+        report_path = await write_qc_report(
+            report,
+            path=work_dir / "render-qc.json",
+            extra={
+                "deliverable_id": subject.id,
+                "render_sha256": render["render_sha256"],
+                "frames": int(render["frames"]),
+            },
+        )
+        qc_asset = await asyncio.to_thread(
+            cas.put_file, report_path, kind="report", ext="json", retention="intermediate"
+        )
+        if report.status == "fail":
+            # Fail-fast, but the report is already in the CAS so the operator
+            # can read exactly what failed (and its fix advice).
+            details = "\n".join(
+                f"- {check.name}: {check.detail or check.value}"
+                f" (threshold {check.threshold})"
+                for check in report.failures()
+            )
+            raise PreflightError(
+                f"render QC failed for {subject.id} (qc report {qc_asset.sha256}):\n"
+                + details
+            )
+        warnings = [check.name for check in report.checks if check.status == "warn"]
+        return StageOutput(
+            output={
+                "deliverable_id": subject.id,
+                "render_sha256": render["render_sha256"],
+                "render_report_sha256": render.get("render_report_sha256"),
+                "qc_report_sha256": qc_asset.sha256,
+                "qc_status": report.status,
+                "qc_version": RENDER_QC_VERSION,
+                "frames": int(render["frames"]),
+                "fps": int(preset.fps),
+                "preset": {
+                    "aspect": preset.aspect.value,
+                    "width": preset.width,
+                    "height": preset.height,
+                },
+                "warnings": warnings,
+                "checks": [
+                    {"name": check.name, "status": check.status}
+                    for check in report.checks
+                ],
             }
         )
