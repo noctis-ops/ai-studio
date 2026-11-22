@@ -83,31 +83,7 @@
       "floor": 88.0
     },
     {
-      "glob": "src/studio/export/*.py",
-      "floor": 88.0
-    },
-    {
-      "glob": "src/studio/retention/*.py",
-      "floor": 88.0
-    },
-    {
-      "glob": "src/studio/bible/*.py",
-      "floor": 88.0
-    },
-    {
-      "glob": "src/studio/pipeline/stages_media.py",
-      "floor": 88.0
-    },
-    {
-      "glob": "src/studio/pipeline/stages_bible.py",
-      "floor": 88.0
-    },
-    {
       "glob": "src/studio/pipeline/stages_render.py",
-      "floor": 88.0
-    },
-    {
-      "glob": "src/studio/export/stage.py",
       "floor": 88.0
     }
   ]

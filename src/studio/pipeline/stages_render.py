@@ -27,7 +27,12 @@ from studio.audio.timeline import build_timeline
 from studio.core.canonical import canonical_json
 from studio.core.cas import ContentStore
 from studio.domain.enums import Language, Scope
-from studio.domain.errors import ConfigError, MediaToolError, PreflightError
+from studio.domain.errors import (
+    ConfigError,
+    MediaToolError,
+    PreflightError,
+    StudioError,
+)
 from studio.domain.refs import SubjectRef
 from studio.pipeline.qc_render import (
     RENDER_QC_VERSION,
@@ -454,7 +459,14 @@ async def assemble_plan(
         raise PreflightError(f"track not found: {deliverable.track_id}")
     preset = _deliverable_preset(ctx, deliverable)
     canvas = (int(preset.width), int(preset.height))
-    timeline = build_timeline(ctx.repos.content, deliverable_id, settings)
+    try:
+        timeline = build_timeline(ctx.repos.content, deliverable_id, settings)
+    except StudioError as exc:
+        # An unbuildable timeline (an S6 column missing) is one problem among
+        # the others, not a crash: the operator sees every blocker at once.
+        raise PreflightError(
+            "assemble preflight failed; nothing was rendered:\n- " + str(exc)
+        ) from exc
     cas = ContentStore(Path(settings.paths.cas), ctx.db, ctx.clock)
 
     shots: list[AssembleShot] = []
@@ -836,7 +848,13 @@ class RenderQcHandler:
         preset = _deliverable_preset(ctx, deliverable)
         render = _render_output(ctx, subject.id)
         cas = ContentStore(Path(settings.paths.cas), ctx.db, ctx.clock)
-        render_path = cas.resolve(str(render["render_sha256"]))
+        try:
+            render_path = cas.resolve(str(render["render_sha256"]))
+        except StudioError as exc:
+            raise PreflightError(
+                f"render asset {render['render_sha256']} is missing from the CAS "
+                f"({exc}); re-run S11"
+            ) from exc
         if not render_path.exists():
             raise PreflightError(
                 f"render asset {render['render_sha256']} is missing from the CAS; "
