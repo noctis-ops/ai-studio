@@ -41,6 +41,10 @@ class SegmentSpec:
     dst_w: int
     dst_h: int
     input_sha: str
+    # S6's locked retiming: the conformed clip has `clip_frames` frames, the
+    # timeline expects ceil(clip_frames / speed) + hold frames.
+    speed_factor: float = 1.0
+    hold_frames: int = 0
 
     def stem(self) -> str:
         return f"seg-{self.index:05d}"
@@ -95,7 +99,26 @@ def sidecar_matches(
         and sidecar.get("assembler_version") == ASSEMBLER_VERSION
         and sidecar.get("container") == container
         and sidecar.get("shot_id") == spec.shot_id
+        and float(sidecar.get("speed_factor", 1.0)) == float(spec.speed_factor)
+        and int(sidecar.get("hold_frames", 0)) == int(spec.hold_frames)
     )
+
+
+def segment_filter(spec: SegmentSpec, plan: FitPlan, *, fps: int) -> str:
+    """Scale/crop, S6 retiming, then the hold as cloned final frames."""
+    chain = plan.filter_chain()
+    if abs(float(spec.speed_factor) - 1.0) > 1e-9:
+        # Retime, then resample to CFR with round=up: ceil(clip_frames/speed)
+        # is exactly what S6 locked, and fractional timestamps would otherwise
+        # drop the final frame (`round=down` produced N-1).
+        chain = (
+            f"setpts=(PTS-STARTPTS)/{float(spec.speed_factor):.9f},"
+            f"fps={fps}:round=up," + chain
+        )
+    if int(spec.hold_frames) > 0:
+        # `stop` counts frames; a duration would round to the wrong frame count.
+        chain += f",tpad=stop_mode=clone:stop={int(spec.hold_frames)}"
+    return chain
 
 
 def segment_args(
@@ -106,7 +129,7 @@ def segment_args(
         "-loglevel", "error",
         "-y",
         "-i", str(spec.src),
-        "-vf", plan.filter_chain(),
+        "-vf", segment_filter(spec, plan, fps=fps),
         "-an",
         "-frames:v", str(spec.clip_frames),
         "-r", str(fps),
@@ -155,6 +178,8 @@ async def render_segment(
         "assembler_version": ASSEMBLER_VERSION,
         "container": container,
         "geometry": plan.report(),
+        "speed_factor": float(spec.speed_factor),
+        "hold_frames": int(spec.hold_frames),
     }
     sidecar_path(out).write_text(json.dumps(sidecar, indent=2, sort_keys=True), encoding="utf-8")
     return SegmentResult(
