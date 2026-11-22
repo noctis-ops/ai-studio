@@ -335,7 +335,9 @@ async def qc_video(
     # First-frame SSIM against the keyframe (recorded always).
     if keyframe_path is not None and await asyncio.to_thread(keyframe_path.exists):
         try:
-            ssim_value = await _ssim_first_frame(path, keyframe_path)
+            ssim_value = await _ssim_first_frame(
+                path, keyframe_path, width=info.width, height=info.height
+            )
         except Exception:
             ssim_value = None
         if ssim_value is not None:
@@ -366,7 +368,18 @@ async def qc_video(
     return checks
 
 
-async def _ssim_first_frame(video_path: Path, keyframe_path: Path) -> float | None:
+async def _ssim_first_frame(
+    video_path: Path, keyframe_path: Path, *, width: int, height: int
+) -> float | None:
+    """First-frame luma SSIM against the keyframe (H5.3: no ``scale2ref``).
+
+    The reference is scaled to the **clip's** probed dimensions with an
+    explicit ``scale=W:H`` instead of the deprecated ``scale2ref`` helper. The
+    clip's own first frame is passed through unchanged (it is already WxH), so
+    the measured value is unchanged.
+    """
+    if width <= 0 or height <= 0:
+        return None
     _o, stderr = await run_ffmpeg(
         [
             "-v", "info",
@@ -376,8 +389,9 @@ async def _ssim_first_frame(video_path: Path, keyframe_path: Path) -> float | No
             # Compare luma only: x264 quantizes 420p chroma aggressively, so
             # the chroma planes measure encoder noise, not content drift.
             "[0:v]trim=end_frame=1,setpts=PTS-STARTPTS[main];"
-            "[1:v]trim=end_frame=1,setpts=PTS-STARTPTS[ref];"
-            "[ref][main]scale2ref[ref2][main2];[main2][ref2]ssim",
+            f"[1:v]trim=end_frame=1,setpts=PTS-STARTPTS,scale={width}:{height}:"
+            "flags=lanczos[ref];"
+            "[main][ref]ssim",
             "-f", "null", "-",
         ],
         timeout_s=60.0,

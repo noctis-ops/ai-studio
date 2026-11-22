@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import os
 import re
+import warnings
 from decimal import Decimal
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -269,7 +270,6 @@ class MediaQcSettings(_Strict):
 class MediaSettings(_Strict):
     poll: MediaPollSettings = MediaPollSettings()
     max_paid_attempts_per_shot: int = Field(default=4, ge=1)
-    circuit_breaker_consecutive_failures: int = Field(default=3, ge=1)
     failed_job_billing: Literal["charge", "free"] = "charge"
     assumed_retry_rate: dict[str, float] = {"image": 0.25, "video": 0.30}
     ref_max_side_px: int = Field(default=1024, ge=16)
@@ -290,6 +290,59 @@ class SanitizerSettings(_Strict):
     max_levels: int = Field(default=2, ge=0)
     model_key: str = "llm.light"
     max_scene_chars: int = Field(default=600, ge=1)
+
+
+# ---------------------------------------------------------------------------
+# H5.1: deprecated settings
+#
+# A knob that no code reads is a lie in the config file. Removed keys stay
+# loadable once (an operator's existing settings.yaml must not break), but they
+# are dropped before validation, reported as a DeprecationWarning, surfaced as
+# a `studio doctor` INFO row and written to the audit log by the CLI.
+# ---------------------------------------------------------------------------
+
+_DEPRECATED_SETTINGS: dict[str, str] = {
+    "media.circuit_breaker_consecutive_failures": "ignored: media stage is fail-fast",
+}
+
+
+def strip_deprecated_settings(data: dict[str, Any], *, source: str = "<config>") -> list[str]:
+    """Remove deprecated keys from a raw settings mapping; return the notes."""
+    notes: list[str] = []
+    for dotted, message in _DEPRECATED_SETTINGS.items():
+        parts = dotted.split(".")
+        node: Any = data
+        for part in parts[:-1]:
+            node = node.get(part) if isinstance(node, dict) else None
+        if isinstance(node, dict) and parts[-1] in node:
+            node.pop(parts[-1])
+            note = f"{source}: {dotted} is deprecated and {message}"
+            warnings.warn(note, DeprecationWarning, stacklevel=3)
+            notes.append(note)
+    return notes
+
+
+def deprecated_settings_in_file(path: Path) -> list[str]:
+    """Doctor helper: which deprecated keys does this file still contain?"""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    try:
+        data = yaml.safe_load(raw)
+    except yaml.YAMLError:
+        return []
+    if not isinstance(data, dict):
+        return []
+    found: list[str] = []
+    for dotted in _DEPRECATED_SETTINGS:
+        parts = dotted.split(".")
+        node: Any = data
+        for part in parts[:-1]:
+            node = node.get(part) if isinstance(node, dict) else None
+        if isinstance(node, dict) and parts[-1] in node:
+            found.append(dotted)
+    return found
 
 
 def _dedupe(values: list[str], *, what: str) -> list[str]:
@@ -440,6 +493,12 @@ class Settings(_Strict):
 
 
 def load_settings_file(path: Path) -> Settings:
+    settings, _notes = load_settings_file_with_report(path)
+    return settings
+
+
+def load_settings_file_with_report(path: Path) -> tuple[Settings, list[str]]:
+    """Load settings, dropping deprecated keys with a DeprecationWarning."""
     source = str(path)
     try:
         raw = path.read_text(encoding="utf-8")
@@ -452,8 +511,9 @@ def load_settings_file(path: Path) -> Settings:
         raise ConfigError(f"{source}: invalid YAML: {exc}") from exc
     if not isinstance(data, dict):
         raise ConfigError(f"{source}: expected a mapping at the top level")
+    notes = strip_deprecated_settings(data, source=source)
     try:
-        return Settings.model_validate(data)
+        return Settings.model_validate(data), notes
     except ValidationError as exc:
         errors = exc.errors()
         if errors:

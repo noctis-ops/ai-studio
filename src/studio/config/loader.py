@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .channels import ChannelsConfig, load_channels_file
 from .registry import ModelRegistry, load_registry_file
-from .settings import Settings, load_settings_file
+from .settings import Settings, load_settings_file_with_report
 from .vocab import Vocab, load_vocab_file
 
 
@@ -21,6 +21,8 @@ class AppConfig:
     registry: ModelRegistry
     vocab: Vocab
     channels: ChannelsConfig
+    # H5.1: deprecated keys that were accepted-and-ignored (audit + doctor rows).
+    config_notes: tuple[str, ...] = ()
 
 
 def load_all(home: Path) -> AppConfig:
@@ -29,10 +31,16 @@ def load_all(home: Path) -> AppConfig:
     registry_path = home / "configs" / "model_registry.yaml"
     vocab_path = home / "configs" / "vocab.yaml"
     channels_path = home / "configs" / "channel_profiles.yaml"
-    settings = load_settings_file(settings_path).resolved_paths(home)
+    settings, notes = load_settings_file_with_report(settings_path)
+    settings = settings.resolved_paths(home)
     registry = load_registry_file(registry_path)
     vocab = load_vocab_file(vocab_path)
     channels = load_channels_file(channels_path)
     return AppConfig(
-        home=home, settings=settings, registry=registry, vocab=vocab, channels=channels
+        home=home,
+        settings=settings,
+        registry=registry,
+        vocab=vocab,
+        channels=channels,
+        config_notes=tuple(notes),
     )

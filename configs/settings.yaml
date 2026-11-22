@@ -81,8 +81,10 @@ fal: {queue_base_url: "https://queue.fal.run", key_env: FAL_KEY,
 media:
   poll: {initial_s: 3, max_s: 15, backoff: 1.5, max_wait_s: 900}
   max_paid_attempts_per_shot: 4
-  circuit_breaker_consecutive_failures: 3
   failed_job_billing: charge            # charge | free  ⚠ unverified how fal bills failed/flagged jobs
+  # H5.1: media is fail-fast (a shot that exhausts QC retries fails the stage).
+  # There is deliberately no circuit-breaker threshold knob: it was parsed but
+  # never read. A file that still carries it loads with a DeprecationWarning.
   assumed_retry_rate: {image: 0.25, video: 0.30}
   ref_max_side_px: 1024
   ref_jpeg_quality: 90
@@ -99,3 +101,4 @@ media:
             first_frame_ssim_warn: 0.6, first_frame_ssim_fail: 0.0, auto_retries: 1}
 character_sheets: {roles: [ref_full], aspect: "9:16"}
 sanitizer: {max_levels: 2, model_key: llm.light, max_scene_chars: 600}
+

@@ -1,0 +1,114 @@
+{
+  "default_floor": 0.0,
+  "total_floor": 91.0,
+  "floors": [
+    {
+      "glob": "src/studio/media/sanitizer.py",
+      "floor": 85.0
+    },
+    {
+      "glob": "src/studio/providers/fal/adapter.py",
+      "floor": 85.0
+    },
+    {
+      "glob": "src/studio/video/ffmpeg.py",
+      "floor": 85.0
+    },
+    {
+      "glob": "src/studio/media/stages.py",
+      "floor": 85.0
+    },
+    {
+      "glob": "src/studio/media/common.py",
+      "floor": 85.0
+    },
+    {
+      "glob": "src/studio/media/retry.py",
+      "floor": 85.0
+    },
+    {
+      "glob": "src/studio/media/preflight.py",
+      "floor": 85.0
+    },
+    {
+      "glob": "src/studio/media/sheets.py",
+      "floor": 85.0
+    },
+    {
+      "glob": "src/studio/media/keyframes.py",
+      "floor": 85.0
+    },
+    {
+      "glob": "src/studio/media/clips.py",
+      "floor": 85.0
+    },
+    {
+      "glob": "src/studio/qc/visual.py",
+      "floor": 85.0
+    },
+    {
+      "glob": "src/studio/media/registry.py",
+      "floor": 85.0
+    },
+    {
+      "glob": "src/studio/video/probe.py",
+      "floor": 85.0
+    },
+    {
+      "glob": "src/studio/pipeline/engine.py",
+      "floor": 88.0
+    },
+    {
+      "glob": "src/studio/pipeline/barrier.py",
+      "floor": 88.0
+    },
+    {
+      "glob": "src/studio/pipeline/gates.py",
+      "floor": 88.0
+    },
+    {
+      "glob": "src/studio/pipeline/panel.py",
+      "floor": 88.0
+    },
+    {
+      "glob": "src/studio/video/geometry.py",
+      "floor": 88.0
+    },
+    {
+      "glob": "src/studio/video/encoders.py",
+      "floor": 88.0
+    },
+    {
+      "glob": "src/studio/assemble/*.py",
+      "floor": 88.0
+    },
+    {
+      "glob": "src/studio/export/*.py",
+      "floor": 88.0
+    },
+    {
+      "glob": "src/studio/retention/*.py",
+      "floor": 88.0
+    },
+    {
+      "glob": "src/studio/bible/*.py",
+      "floor": 88.0
+    },
+    {
+      "glob": "src/studio/pipeline/stages_media.py",
+      "floor": 88.0
+    },
+    {
+      "glob": "src/studio/pipeline/stages_bible.py",
+      "floor": 88.0
+    },
+    {
+      "glob": "src/studio/pipeline/stages_render.py",
+      "floor": 88.0
+    },
+    {
+      "glob": "src/studio/export/stage.py",
+      "floor": 88.0
+    }
+  ]
+}

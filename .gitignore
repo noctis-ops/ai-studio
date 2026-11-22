@@ -10,4 +10,12 @@ library/**/*.mp3
 library/**/*.flac
 .coverage
 coverage.xml
+coverage.json
 htmlcov/
+.venv/
+
+# Workspace-local media binaries (ffmpeg/ffprobe); never committed.
+.tools/
+
+# Encoder-probe scratch output (studio encode probe without a cache path).
+probe-work/

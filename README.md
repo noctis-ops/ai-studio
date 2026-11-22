@@ -99,17 +99,27 @@ export STUDIO_HOME="$PWD"
 .venv/bin/studio run --demo --profile sandbox \
     --languages ar                           # prints "run id: <id>"
 .venv/bin/studio worker --until-idle        # advances until a gate pauses the run
-.venv/bin/studio gates list                 # shows the G1_SCRIPT gate
-.venv/bin/studio gates approve <G1_ID>
-.venv/bin/studio worker --until-idle        # ...until the G2_KEYFRAMES gate
+.venv/bin/studio gates list                 # shows every pending round, oldest first
+# Gate order is fixed: G1 script -> G1 metadata text -> G0 sheets -> G2 animatic -> G3 render.
+.venv/bin/studio gates approve <G1_SCRIPT_ID>
+.venv/bin/studio worker --until-idle        # ...until the metadata text approval
+.venv/bin/studio gates approve <G1_METADATA_ID>
+.venv/bin/studio worker --until-idle        # ...until the G0_CHARACTERS gate
+.venv/bin/studio gates approve <G0_ID>
+.venv/bin/studio worker --until-idle        # ...until the G2_KEYFRAMES gate (on the animatic)
+.venv/bin/studio gates show <G2_ID>         # cost panel: spent, projected, remaining cap
 .venv/bin/studio gates approve <G2_ID>
-.venv/bin/studio worker --until-idle        # ...until the G3_FINAL_CUT gate
-.venv/bin/studio gates approve <G3_ID>
+.venv/bin/studio worker --until-idle        # ...until the G3_FINAL_CUT gate (on the render)
+.venv/bin/studio gates approve <G3_ID> --checklist-file checklist.json
 .venv/bin/studio worker --until-idle        # run reaches status=completed
+.venv/bin/studio export <RUN_ID>            # writes exports/<channel_key>/<date>_<slug>/
 ```
 
-The final manifest asset is stored under `data/cas/<sha[:2]>/<sha[2:4]>/<sha>.json`
-(forward-slash relative path in the `assets` table).
+`auto_approve` is a **sandbox/draft** convenience only (`gates.allow_auto_approve_in`);
+the `final` profile never auto-approves and the G3 checklist must be filled by a
+human. The exported MP4 is copied from the approved render asset, and its sha256
+is re-verified after the copy. Inspect the final render with
+`studio media preview <RUN_ID> --stage render`.
 
 ## Running the demo (Windows / PowerShell)
 
@@ -250,10 +260,14 @@ exercise `studio tts audition` / `T-EL-06` for real.
   calls for every crash point, with one documented exception:
   `after_submit_before_persist` leaves a provider-side orphan that is logged via a
   `potential_orphan` audit event.
-- **Gates.** G1_SCRIPT, G2_KEYFRAMES, G3_FINAL_CUT. A pending gate pauses the
-  whole run (`awaiting_approval`); `gates approve` enqueues the next `advance_run`.
-  `gates reject --shot <id>` creates a new attempt for **only** that shot and
-  re-runs the affected stages. `final` never auto-approves.
+- **Gates.** G1_SCRIPT (script + metadata text), G0_CHARACTERS (sheets),
+  G2_KEYFRAMES (recorded on the S9 animatic) and G3_FINAL_CUT (recorded on the
+  S12 render). A pending gate pauses the whole run (`awaiting_approval`);
+  `gates approve` enqueues the next `advance_run`. `gates reject --shots 3,7`
+  creates a new attempt for **only** those shots and re-runs the affected
+  stages. `final` never auto-approves. No paid stage may sit below a
+  `G3_FINAL_CUT` ancestor (T-GATE-02), which is why the metadata approval is a
+  `G1_SCRIPT` round.
 
 ## Media pipeline (Phase 4)
 
@@ -282,9 +296,14 @@ s4p_media_preflight (free) → s5a/s5 (TTS) → s6_timing → s7/s7b (audio)
   SAR 1, libx264/yuv420p; already-compliant raws are referenced without re-encode.
 * **Gates.** G0 and G2 snapshot asset shas + prompts; approval flips rows and
   lets the pipeline advance; rejection regenerates only the affected subjects.
-* **Circuit breaker (fail-fast).** Any shot that exhausts QC retries fails the
-  stage and the run; a single non-retryable QC failure raises
-  `MediaCircuitOpen` and writes a `media_circuit_open` audit row.
+* **Fail-fast (no circuit-breaker knob).** Any shot that exhausts QC retries
+  fails the stage and the run; a single non-retryable QC failure raises
+  `MediaCircuitOpen` and writes a `media_circuit_open` audit row. The Phase 4
+  `media.circuit_breaker_consecutive_failures` key was parsed but read by no
+  code, so Phase 5 removed it (H5.1). A settings file that still carries it
+  logs a `DeprecationWarning`, writes a `config_deprecated_key_ignored` audit
+  row and shows one `INFO` row in `studio doctor` ("ignored: media stage is
+  fail-fast").
 * **Sanitizer** rewrites policy-refused scene text (level 1: light rewrite,
   level 2: deterministic lexicon + stronger rewrite), never resubmits an
   identical prompt, and parks the shot for a human after `sanitizer.max_levels`.

@@ -56,6 +56,8 @@ app.add_typer(narration_app, name="narration")
 app.add_typer(library_app, name="library")
 app.add_typer(tts_app, name="tts")
 app.add_typer(audio_app, name="audio")
+encode_app = typer.Typer(help="Encoder utilities (probe).")
+app.add_typer(encode_app, name="encode")
 
 console = Console()
 err_console = Console(stderr=True)
@@ -492,6 +494,48 @@ def _llm_live_rows() -> list[tuple[str, str, str]]:
     return rows
 
 
+def _config_note_rows() -> list[tuple[str, str, str]]:
+    """H5.1: one INFO row per deprecated-but-accepted settings key."""
+    from studio.config.settings import deprecated_settings_in_file
+
+    path = _home() / "configs" / "settings.yaml"
+    keys = deprecated_settings_in_file(path)
+    if not keys:
+        return []
+    from studio.config.settings import _DEPRECATED_SETTINGS
+
+    return [
+        (
+            f"{key} (deprecated)",
+            "INFO",
+            _DEPRECATED_SETTINGS[key],
+        )
+        for key in keys
+    ]
+
+
+def _audit_config_notes() -> None:
+    """Write one audit row per accepted deprecated key (never fatal)."""
+    try:
+        config = load_all(_home())
+    except Exception:
+        return
+    if not config.config_notes:
+        return
+    try:
+        _, db, _clock, _ids, repos = _connect()
+        migrate(db)
+        for note in config.config_notes:
+            repos.audit.append(
+                actor="config",
+                entity="config:settings.yaml",
+                event="config_deprecated_key_ignored",
+                payload={"note": note},
+            )
+    except Exception:
+        return
+
+
 @app.command()
 def doctor(
     llm: bool = typer.Option(
@@ -501,6 +545,7 @@ def doctor(
     ),
 ) -> None:
     """Environment checks. NEVER fails on the NVENC probe."""
+    _audit_config_notes()
     checks: list[tuple[str, str, str]] = []  # name, status, detail
 
     version = sys.version_info
@@ -579,6 +624,9 @@ def doctor(
     # chain_mode, placeholder endpoints.
     checks.extend(_media_doctor_rows(missing_filters))
 
+    # H5.1: deprecated settings are accepted-and-ignored, never silent.
+    checks.extend(_config_note_rows())
+
     # Phase 2: both LLM registry entries must be verified (dates shown).
     checks.extend(_llm_registry_rows())
     if llm:
@@ -638,7 +686,7 @@ def doctor(
     table.add_column("detail")
     failures = 0
     for name, status, detail in checks:
-        style = {"PASS": "green", "WARN": "yellow", "FAIL": "red"}[status]
+        style = {"PASS": "green", "WARN": "yellow", "FAIL": "red", "INFO": "cyan"}[status]
         table.add_row(name, f"[{style}]{status}[/{style}]", detail)
         if status == "FAIL":
             failures += 1
@@ -2067,11 +2115,18 @@ def shot_regenerate(
         row.id
         for row in repos.pipeline.list_stage_runs(run_id)
         if row.stage in stages_to_stale
-        and row.status in ("succeeded", "pending", "running", "stale")
+        and row.status in ("succeeded", "pending", "running", "stale", "failed")
         and subjects_related(anchor, subject_from_stage_run(row))
     ]
-    if affected:
-        repos.pipeline.mark_stale(affected)
+    # H5.4: a `failed` row (e.g. failed_policy) cannot be staled by mark_stale
+    # (SQL guard) and would keep the stage/run failed forever. Reset it with a
+    # cleared input hash so the fresh attempt is evaluated from scratch.
+    failed_rows = [row_id for row_id in affected if _stage_row_is_failed(repos, row_id)]
+    for row_id in failed_rows:
+        repos.pipeline.set_stage_run(row_id, status="pending", clear_input_hash=True)
+    staled = [row_id for row_id in affected if row_id not in set(failed_rows)]
+    if staled:
+        repos.pipeline.mark_stale(staled)
 
     if reopen_from is not None:
         repos.pipeline.set_run_status(run_id, RunStatus.RUNNING.value)
@@ -2112,6 +2167,11 @@ def shot_regenerate(
         f"({len(affected)} stage run(s) staled)"
     )
     console.print("run `studio worker --until-idle` to regenerate")
+
+
+def _stage_row_is_failed(repos: Any, stage_run_id: str) -> bool:
+    row = repos.pipeline.get_stage_run(stage_run_id)
+    return row is not None and row.status == "failed"
 
 
 def _cas(config: AppConfig, db: Database, clock: SystemClock) -> Any:
@@ -3208,6 +3268,57 @@ def _write_smoke_artifacts(
         f"ledger vs expected: actual ${musd_to_usd(total_actual):.4f} "
         f"vs worst case ${musd_to_usd(worst_case_musd):.4f}"
     )
+
+
+# ==================================================================
+# encode
+# ==================================================================
+
+
+@encode_app.command("probe")
+def encode_probe(
+    use_cache: bool = typer.Option(True, "--cache/--no-cache", help="Reuse the probe cache."),
+) -> None:
+    """Probe NVENC with a real encode and print the resolved encoder.
+
+    Presence in `ffmpeg -encoders` is never trusted: the probe encodes 24 frames
+    at every export preset geometry. `encode.encoder: nvenc` fails closed,
+    `auto` falls back to x264 and records the scrubbed reason.
+    """
+    from studio.video.encoders import SubprocessProbeRunner, driver_string, resolve_encoder
+    from studio.video.ffmpeg import ffmpeg_version
+
+    config, *_ = _connect()
+    geometries = sorted({(p.width, p.height) for p in config.presets.channels.values()})
+    cache_file = config.settings.encode.probe.cache_file
+    cache_path = Path(cache_file) if Path(cache_file).is_absolute() else _home() / cache_file
+    version = ".".join(str(part) for part in _run_async(ffmpeg_version()))
+    try:
+        resolution = _run_async(
+            resolve_encoder(
+                config.settings,
+                SubprocessProbeRunner(),
+                geometries=geometries,
+                cache_path=cache_path if use_cache else None,
+                ffmpeg_version=version,
+                driver=driver_string(),
+            )
+        )
+    except StudioError as exc:
+        _fail(str(exc))
+    console.print(f"encoder: [bold]{resolution.profile.name}[/bold]")
+    console.print(f"reason:  {resolution.reason}")
+    if resolution.fallback_reason:
+        console.print(f"fallback: {resolution.fallback_reason}")
+    console.print(f"profile_hash: {resolution.profile.profile_hash}")
+    console.print(f"args: {' '.join(resolution.profile.args)}")
+    console.print(
+        f"cache: {'hit' if resolution.cache_hit else 'miss'} at {cache_path}"
+        if use_cache
+        else "cache: disabled"
+    )
+    console.print(f"geometries: {', '.join(f'{w}x{h}' for w, h in geometries)}")
+
 
 def main() -> None:  # pragma: no cover
     app()

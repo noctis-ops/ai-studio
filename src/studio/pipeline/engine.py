@@ -202,7 +202,13 @@ class Engine:
             )
         for row in self.repos.pipeline.list_stage_runs(run_id):
             if row.status == "failed":
-                self.repos.pipeline.set_stage_run(row.id, status="pending")
+                # H5.4: a failed row keeps the input_hash it failed against. If
+                # the operator edited the prompt in between, `_execute_stage_job`
+                # would see a mismatch, re-pend the row and loop forever. Clear
+                # it so the next job evaluates the new attempt from scratch.
+                self.repos.pipeline.set_stage_run(
+                    row.id, status="pending", clear_input_hash=True
+                )
         self.repos.pipeline.set_run_status(run_id, RunStatus.RUNNING.value)
         if run.episode_id:
             self.repos.content.set_episode_status(run.episode_id, RunStatus.RUNNING.value)
@@ -507,7 +513,9 @@ class Engine:
             current_hash = None
             logger.warning("input_hash() failed for %s; proceeding", stage_run_id)
         if row.input_hash and current_hash and current_hash != row.input_hash:
-            self.repos.pipeline.set_stage_run(stage_run_id, status="pending")
+            self.repos.pipeline.set_stage_run(
+                stage_run_id, status="pending", clear_input_hash=True
+            )
             self.repos.jobs.complete(job.id)
             self.repos.jobs.enqueue(
                 kind="advance_run",
