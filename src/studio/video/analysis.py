@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 _SIGNALSTATS_LEGACY_RE = re.compile(r"YAVG:\s*([0-9.]+).*?YSTD:\s*([0-9.]+)", re.DOTALL)
@@ -108,6 +109,29 @@ def _parse_fraction(text: str) -> float | None:
         return float(num) / d if d else None
     except ValueError:
         return None
+
+
+async def probe_frames(path: Path) -> ProbeInfo:
+    """Probe a media file with an exact decode count (``-count_frames``).
+
+    Used by the segment verifier and the NVENC probe: a container's reported
+    frame count is not evidence, only a decoded count is.
+    """
+    from studio.video.ffmpeg import run_ffprobe
+
+    stdout, _ = await run_ffprobe(
+        [
+            "-v", "error",
+            "-count_frames",
+            "-show_entries",
+            "stream=codec_type,width,height,avg_frame_rate,r_frame_rate,nb_read_frames,codec_name",
+            "-show_entries", "format=duration",
+            "-of", "json",
+            str(path),
+        ],
+        timeout_s=60.0,
+    )
+    return parse_ffprobe_json(stdout)
 
 
 def parse_ffprobe_json(raw: str | bytes) -> ProbeInfo:

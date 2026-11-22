@@ -68,7 +68,13 @@ REQUIRED_FILTERS = (
     "ametadata", "pan", "asplit",
     "signalstats", "blackdetect", "freezedetect", "ssim", "fps", "trim",
     "setpts", "tpad", "scale", "setsar", "format",
+    # Phase 5 (§H): segmented assembly + render QC.
+    "concat",
 )
+
+# Phase 5 §H: assembly/QC need these encoders + muxers, not just filters.
+REQUIRED_ENCODERS = ("aac", "libx264")
+REQUIRED_MUXERS = ("mp4", "matroska", "mpegts")
 
 _version_cache: tuple[int, int, int] | None = None
 
@@ -117,12 +123,52 @@ async def available_filters() -> set[str]:
     return filters
 
 
+def _parse_flag_table(text: str) -> set[str]:
+    """Names from `ffmpeg -encoders` / `-muxers` tables.
+
+    The flag column width differs per table and per ffmpeg release ("V....D",
+    " E "), so the flags are validated as a token instead of at a fixed offset.
+    """
+    import re
+
+    names: set[str] = set()
+    for line in text.splitlines():
+        tokens = line.split()
+        if len(tokens) < 2:
+            continue
+        if re.fullmatch(r"[A-Za-z.]{1,6}", tokens[0]) and re.fullmatch(
+            r"[a-z0-9_]+", tokens[1]
+        ):
+            names.add(tokens[1])
+    return names
+
+
+async def available_encoders() -> set[str]:
+    stdout, _ = await run_ffmpeg(["-hide_banner", "-encoders"], timeout_s=30.0)
+    return _parse_flag_table(stdout.decode("utf-8", errors="replace"))
+
+
+async def available_muxers() -> set[str]:
+    stdout, _ = await run_ffmpeg(["-hide_banner", "-muxers"], timeout_s=30.0)
+    return _parse_flag_table(stdout.decode("utf-8", errors="replace"))
+
+
 async def capability_check() -> tuple[tuple[int, int, int], list[str]]:
     """D3: return (version, missing_required_filters)."""
     version = await ffmpeg_version()
     have = await available_filters()
     missing = [name for name in dict.fromkeys(REQUIRED_FILTERS) if name not in have]
     return version, missing
+
+
+async def assembly_capability_check() -> tuple[list[str], list[str], list[str]]:
+    """Phase 5 §H: (missing_filters, missing_encoders, missing_muxers)."""
+    encoders = await available_encoders()
+    muxers = await available_muxers()
+    _version, missing_filters = await capability_check()
+    missing_encoders = [n for n in REQUIRED_ENCODERS if n not in encoders]
+    missing_muxers = [n for n in REQUIRED_MUXERS if n not in muxers]
+    return missing_filters, missing_encoders, missing_muxers
 
 
 async def probe_duration_seconds(path: str, *, timeout_s: float = 30.0) -> float:

@@ -14,6 +14,13 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIGS_SRC = REPO_ROOT / "configs"
 
+# Some sandboxes ship no ffmpeg at all. A workspace-local `.tools/bin/ffmpeg`
+# and `ffprobe` (git-ignored, see README "Local media tools") is picked up
+# automatically; in CI the binaries are already on PATH and this is a no-op.
+_LOCAL_BIN = REPO_ROOT / ".tools" / "bin"
+if (_LOCAL_BIN / "ffmpeg").exists() and os.environ.get("PATH", "").find(str(_LOCAL_BIN)) < 0:
+    os.environ["PATH"] = f"{_LOCAL_BIN}{os.pathsep}" + os.environ.get("PATH", "")
+
 # T-LIVE-01: the live smoke test is opt-in; when STUDIO_LIVE_LLM != '1' it is
 # not collected at all (not merely skipped) — it must never run in CI.
 collect_ignore = []
