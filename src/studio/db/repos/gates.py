@@ -21,6 +21,7 @@ class GatesRepo(Protocol):
         subject_id: str | None,
         round: int,
         snapshot_hash: str | None,
+        presented_json: str | None = None,
     ) -> GateRow: ...
 
     def get(self, gate_id: str) -> GateRow | None: ...
@@ -29,7 +30,14 @@ class GatesRepo(Protocol):
 
     def count_rounds(self, run_id: str, stage: str) -> int: ...
 
-    def decide(self, gate_id: str, *, status: str, note: str | None) -> GateRow | None: ...
+    def decide(
+        self,
+        gate_id: str,
+        *,
+        status: str,
+        note: str | None,
+        checklist_json: str | None = None,
+    ) -> GateRow | None: ...
 
     def list_pending(self, run_id: str | None = None) -> list[GateRow]: ...
 
@@ -47,6 +55,7 @@ class SqliteGatesRepo(SqliteRepo):
         subject_id: str | None,
         round: int,
         snapshot_hash: str | None,
+        presented_json: str | None = None,
     ) -> GateRow:
         now = self._now()
         gate_id = self._new_id()
@@ -55,10 +64,21 @@ class SqliteGatesRepo(SqliteRepo):
             """
             INSERT INTO approval_gates(id, run_id, gate, stage, scope, subject_id,
                                        round, status, snapshot_hash, note,
-                                       created_at, decided_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, ?, NULL)
+                                       created_at, decided_at, presented_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, ?, NULL, ?)
             """,
-            (gate_id, run_id, gate, stage, scope, subject_id, round, snapshot_hash, now),
+            (
+                gate_id,
+                run_id,
+                gate,
+                stage,
+                scope,
+                subject_id,
+                round,
+                snapshot_hash,
+                now,
+                presented_json,
+            ),
         )
         row = conn.execute("SELECT * FROM approval_gates WHERE id = ?", (gate_id,)).fetchone()
         assert row is not None
@@ -95,12 +115,20 @@ class SqliteGatesRepo(SqliteRepo):
         )
         return int(row["n"])
 
-    def decide(self, gate_id: str, *, status: str, note: str | None) -> GateRow | None:
+    def decide(
+        self,
+        gate_id: str,
+        *,
+        status: str,
+        note: str | None,
+        checklist_json: str | None = None,
+    ) -> GateRow | None:
         now = self._now()
         conn = self.db.connect()
         conn.execute(
-            "UPDATE approval_gates SET status = ?, note = ?, decided_at = ? WHERE id = ?",
-            (status, note, now, gate_id),
+            "UPDATE approval_gates SET status = ?, note = ?, decided_at = ?, "
+            "checklist_json = COALESCE(?, checklist_json) WHERE id = ?",
+            (status, note, now, checklist_json, gate_id),
         )
         return self.get(gate_id)
 

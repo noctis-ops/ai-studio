@@ -31,6 +31,13 @@ class StageSpec:
     # both approved and still bound to the current stage outputs before the
     # handler is entered. Free stages are unaffected.
     spends_money: bool = False
+    # Phase 5 (H5.7): a *free* stage may still need ancestor gates cleared
+    # before it runs (S9 animatic is free but must not render an unapproved
+    # cut). Defaults keep every Phase <= 4 spec unchanged.
+    requires_cleared_gates: bool = False
+    # The stage whose output a rejection of this stage's gate must stale.
+    # ``None`` keeps the historical behaviour (stale this stage + downstream).
+    gate_reject_stage: str | None = None
 
 
 @dataclass(frozen=True)

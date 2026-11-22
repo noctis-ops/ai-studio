@@ -11,6 +11,10 @@ stage may spend. For every ancestor stage carrying a gate it requires:
 
 A gated ancestor with zero succeeded stage runs needs no approval (e.g. S8a
 generates no sheets and therefore creates no G0 round).
+
+Phase 5 (§S15) adds a second, independent barrier: once an episode is
+``published`` or ``archived`` it is closed, and no paid stage may run for it
+(``EpisodeClosed``). Free stages stay runnable so a re-export remains possible.
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ from typing import TYPE_CHECKING
 
 from studio.core.canonical import canonical_json
 from studio.domain.errors import GateNotCleared
-from studio.domain.models import StageRunRow
+from studio.domain.models import PipelineRunRow, StageRunRow
 
 if TYPE_CHECKING:
     from studio.db.repos import StudioRepos
@@ -74,6 +78,21 @@ def ancestor_gate_problems(
     return problems
 
 
+_CLOSED = frozenset({"published", "archived"})
+
+
+def episode_closed_problem(repos: StudioRepos, run: PipelineRunRow) -> str | None:
+    """Return a human-readable reason when the run's episode is closed."""
+    if not run.episode_id:
+        return None
+    episode = repos.content.get_episode(run.episode_id)
+    if episode is None:
+        return None
+    if episode.status in _CLOSED:
+        return f"episode {episode.id} is {episode.status}"
+    return None
+
+
 def assert_gates_cleared(
     *, repos: StudioRepos, dag: Dag, run_id: str, stage_id: str
 ) -> None:
@@ -83,3 +102,10 @@ def assert_gates_cleared(
         raise GateNotCleared(
             f"paid stage {stage_id!r} blocked by ancestor gates: " + "; ".join(problems)
         )
+
+
+def free_stage_gate_problems(
+    *, repos: StudioRepos, dag: Dag, run_id: str, stage_id: str
+) -> list[str]:
+    """Gate proof for a *free* stage that still requires cleared ancestors."""
+    return ancestor_gate_problems(repos=repos, dag=dag, run_id=run_id, stage_id=stage_id)

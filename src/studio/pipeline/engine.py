@@ -463,10 +463,31 @@ class Engine:
         subject = subject_from_stage_run(row)
         ctx = self._context(run, stage_run_id)
 
-        # ---- H0: paid-stage gate barrier --------------------------------
+        # ---- H0 / H5.7: stage barrier -------------------------------------
         # This runs BEFORE input_hash/run: a speculative job claimed while a
         # gate is pending must never reach a handler that can spend money.
+        # Phase 5: free stages may opt in (`requires_cleared_gates`) and a
+        # closed episode blocks every paid stage regardless of gates.
+        needs_gate_proof = spec.spends_money or spec.requires_cleared_gates
         if spec.spends_money:
+            from studio.pipeline.barrier import episode_closed_problem
+
+            closed = episode_closed_problem(self.repos, run)
+            if closed is not None:
+                self.repos.jobs.complete(job.id)
+                self.repos.audit.append(
+                    actor="system",
+                    entity=f"stage_run:{stage_run_id}",
+                    event="episode_closed",
+                    payload={
+                        "run_id": run.id,
+                        "stage": spec.name,
+                        "subject": subject.id,
+                        "reason": closed,
+                    },
+                )
+                return
+        if needs_gate_proof:
             from studio.pipeline.barrier import ancestor_gate_problems
 
             ctx.gate_cleared = False
@@ -478,7 +499,11 @@ class Engine:
                 self.repos.audit.append(
                     actor="system",
                     entity=f"stage_run:{stage_run_id}",
-                    event="paid_stage_deferred",
+                    event=(
+                        "paid_stage_deferred"
+                        if spec.spends_money
+                        else "free_stage_deferred"
+                    ),
                     payload={
                         "run_id": run.id,
                         "stage": spec.name,

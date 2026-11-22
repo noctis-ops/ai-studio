@@ -87,6 +87,8 @@ class MockSettings(_Strict):
 class RetentionSettings(_Strict):
     keep_raw_clips_days: int = Field(default=30, ge=0)
     keep_narration_audio_days: int = Field(default=30, ge=0)
+    # Phase 5 §F: assets of non-accepted attempts older than this may be purged.
+    rejected_attempt_days: int = Field(default=7, ge=0)
 
 
 class DoctorSettings(_Strict):
@@ -345,6 +347,82 @@ def deprecated_settings_in_file(path: Path) -> list[str]:
     return found
 
 
+# ---------------------------------------------------------------------------
+# Phase 5 (§F): encode / assemble / animatic / render QC / export / bible
+#
+# Every ⚠ value is an uncalibrated starting point, tunable by the operator.
+# ---------------------------------------------------------------------------
+
+
+class NvencSettings(_Strict):
+    preset: str = "p5"
+    rc: Literal["vbr", "cbr"] = "vbr"
+    cq: int = Field(default=19, ge=0, le=51)
+
+
+class X264Settings(_Strict):
+    crf: int = Field(default=18, ge=0, le=51)
+    preset: str = "medium"
+
+
+class EncodeProbeSettings(_Strict):
+    timeout_s: float = Field(default=30.0, gt=0)
+    cache_file: str = "data/cache/encoder_probe.json"
+
+
+class EncodeSettings(_Strict):
+    encoder: Literal["auto", "nvenc", "x264"] = "auto"
+    nvenc: NvencSettings = NvencSettings()
+    x264: X264Settings = X264Settings()
+    probe: EncodeProbeSettings = EncodeProbeSettings()
+
+
+class AvSyncSettings(_Strict):
+    warn_ms: float = Field(default=40.0, ge=0)
+    fail_ms: float = Field(default=100.0, gt=0)
+
+
+class AssembleSettings(_Strict):
+    segment_container: Literal["mkv", "ts"] = "mkv"
+    max_inputs_per_graph: int = Field(default=24, ge=1)
+    geometry_tolerance_pct: float = Field(default=2.0, gt=0)
+    min_free_disk_factor: float = Field(default=2.5, gt=0)
+    av_sync: AvSyncSettings = AvSyncSettings()
+
+
+class AnimaticSettings(_Strict):
+    short_side_px: int = Field(default=540, ge=64)
+    crf: int = Field(default=28, ge=0, le=51)
+    preset: str = "veryfast"
+    audio_bitrate_k: int = Field(default=96, ge=32)
+
+
+class RenderQcSettings(_Strict):
+    video_scan: bool = True
+    duration_tolerance_frames: int = Field(default=1, ge=0)
+    true_peak_warn_db: float = -1.0
+    true_peak_fail_db: float = -0.3
+
+
+class QcRootSettings(_Strict):
+    render: RenderQcSettings = RenderQcSettings()
+
+
+class ExportSettings(_Strict):
+    root: str = "exports"
+    draft_root: str = "exports/_draft"
+    thumbnails: int = Field(default=3, ge=0, le=9)
+
+
+class BibleProposalsSettings(_Strict):
+    model_role: str = "creative"
+    max_facts: int = Field(default=40, ge=1, le=200)
+
+
+class BibleSettings(_Strict):
+    proposals: BibleProposalsSettings = BibleProposalsSettings()
+
+
 def _dedupe(values: list[str], *, what: str) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
@@ -378,6 +456,12 @@ class Settings(_Strict):
     media: MediaSettings = MediaSettings()
     character_sheets: CharacterSheetsSettings = CharacterSheetsSettings()
     sanitizer: SanitizerSettings = SanitizerSettings()
+    encode: EncodeSettings = EncodeSettings()
+    assemble: AssembleSettings = AssembleSettings()
+    animatic: AnimaticSettings = AnimaticSettings()
+    qc: QcRootSettings = QcRootSettings()
+    export: ExportSettings = ExportSettings()
+    bible: BibleSettings = BibleSettings()
 
     @model_validator(mode="after")
     def _check_cross_field(self) -> Settings:
@@ -439,6 +523,23 @@ class Settings(_Strict):
             )
         if self.media.poll.max_s < self.media.poll.initial_s:
             raise ConfigError("media.poll.max_s must be >= media.poll.initial_s")
+        # ---- Phase 5 config validation (§F) --------------------------------
+        if self.assemble.av_sync.fail_ms <= self.assemble.av_sync.warn_ms:
+            raise ConfigError(
+                "assemble.av_sync.fail_ms must be > assemble.av_sync.warn_ms"
+            )
+        if self.qc.render.true_peak_fail_db < self.qc.render.true_peak_warn_db:
+            raise ConfigError(
+                "qc.render.true_peak_fail_db must be >= qc.render.true_peak_warn_db"
+            )
+        if not self.export.root or not self.export.draft_root:
+            raise ConfigError("export.root and export.draft_root must not be empty")
+        if Path(self.export.draft_root).resolve() == Path(self.export.root).resolve():
+            raise ConfigError(
+                "export.draft_root must differ from export.root (drafts never mix with finals)"
+            )
+        if self.assemble.geometry_tolerance_pct <= 0:
+            raise ConfigError("assemble.geometry_tolerance_pct must be > 0")
         return self
 
     @field_validator("languages", mode="before")

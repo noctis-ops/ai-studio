@@ -18,7 +18,6 @@ budgets:
 pricing: {llm_tokens_per_char_worst_case: 0.5}   # conservative for Arabic when estimating input tokens
 mock: {tts_chars_per_second: 15, video_width_16x9: 960, video_height_16x9: 540, fps: 24,
        poll_ticks: 2}
-retention: {keep_raw_clips_days: 30, keep_narration_audio_days: 30}
 text_pipeline: {context_token_budget: 6000, tashkeel_retry: 1, s4_after_g1: true}
 
 # ---- Phase 3: voice + local audio engine ----
@@ -102,3 +101,31 @@ media:
 character_sheets: {roles: [ref_full], aspect: "9:16"}
 sanitizer: {max_levels: 2, model_key: llm.light, max_scene_chars: 600}
 
+# ---- Phase 5: assembly, render QC, export, bible proposals, retention ----
+# Every ⚠ value is an uncalibrated starting point. Platform numbers live in
+# export_presets.yaml and are ⚠ unverified (WARN-level checks only).
+encode:
+  encoder: auto                   # auto | nvenc | x264. `nvenc` fails closed if the probe fails.
+  nvenc: {preset: p5, rc: vbr, cq: 19}       # ⚠ operator-tunable, not platform-mandated
+  x264: {crf: 18, preset: medium}
+  probe: {timeout_s: 30, cache_file: data/cache/encoder_probe.json}
+assemble:
+  segment_container: mkv          # mkv | ts. Segments are joined with the concat demuxer.
+  max_inputs_per_graph: 24        # a 20-minute episode is ~240 clips: never one giant graph
+  geometry_tolerance_pct: 2.0     # ⚠ aspect mismatch beyond this fails closed
+  min_free_disk_factor: 2.5       # ⚠ free disk must be >= factor x (clips + master)
+  av_sync: {warn_ms: 40, fail_ms: 100}       # ⚠ uncalibrated
+animatic:
+  short_side_px: 540              # 540x960 tall, 960x540 wide
+  crf: 28
+  preset: veryfast
+  audio_bitrate_k: 96
+qc:
+  render:
+    video_scan: true              # blackdetect/freezedetect on the whole render (warn-level)
+    duration_tolerance_frames: 1
+    true_peak_warn_db: -1.0       # ⚠ measured on the muxed AAC, not copied from the master
+    true_peak_fail_db: -0.3       # ⚠
+export: {root: exports, draft_root: exports/_draft, thumbnails: 3}
+bible: {proposals: {model_role: creative, max_facts: 40}}
+retention: {keep_raw_clips_days: 30, keep_narration_audio_days: 30, rejected_attempt_days: 7}

@@ -1,0 +1,57 @@
+# Phase 5 §F: export presets, keyed by channel key from channel_profiles.yaml.
+#
+# The key set MUST equal the channel key set (validated at load: T-EXP-04), so a
+# channel can never exist without a preset and vice-versa.
+#
+# Every platform number below is ⚠ unverified: YouTube / Shorts / TikTok limits
+# change without notice and are enforced as WARN-level checks only. Bitrates are
+# starting points, not platform mandates.
+channels:
+  yt_ar_wide:
+    aspect: "16:9"
+    width: 1920
+    height: 1080
+    fps: 24
+    video: {maxrate_k: 12000, bufsize_k: 24000}      # ⚠ unverified
+    audio: {codec: aac, bitrate_k: 192, sample_rate: 48000, channels: 2}
+    limits:
+      max_duration_s: null                            # long-form: no Shorts cap
+      title_max_chars: 100                            # ⚠ unverified
+      description_max_bytes: 5000                     # ⚠ unverified
+      hashtags_max: 15                                # ⚠ unverified
+  yt_en_wide:
+    aspect: "16:9"
+    width: 1920
+    height: 1080
+    fps: 24
+    video: {maxrate_k: 12000, bufsize_k: 24000}      # ⚠ unverified
+    audio: {codec: aac, bitrate_k: 192, sample_rate: 48000, channels: 2}
+    limits:
+      max_duration_s: null
+      title_max_chars: 100                            # ⚠ unverified
+      description_max_bytes: 5000                     # ⚠ unverified
+      hashtags_max: 15                                # ⚠ unverified
+  short_ar_tall:
+    aspect: "9:16"
+    width: 1080
+    height: 1920
+    fps: 24
+    video: {maxrate_k: 8000, bufsize_k: 16000}       # ⚠ unverified
+    audio: {codec: aac, bitrate_k: 192, sample_rate: 48000, channels: 2}
+    limits:
+      max_duration_s: 180                             # ⚠ unverified (Shorts/TikTok)
+      title_max_chars: 100                            # ⚠ unverified
+      description_max_bytes: 5000                     # ⚠ unverified
+      hashtags_max: 30                                # ⚠ unverified
+  short_en_tall:
+    aspect: "9:16"
+    width: 1080
+    height: 1920
+    fps: 24
+    video: {maxrate_k: 8000, bufsize_k: 16000}       # ⚠ unverified
+    audio: {codec: aac, bitrate_k: 192, sample_rate: 48000, channels: 2}
+    limits:
+      max_duration_s: 180                             # ⚠ unverified (Shorts/TikTok)
+      title_max_chars: 100                            # ⚠ unverified
+      description_max_bytes: 5000                     # ⚠ unverified
+      hashtags_max: 30                                # ⚠ unverified

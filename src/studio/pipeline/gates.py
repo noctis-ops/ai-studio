@@ -9,8 +9,10 @@ gates.allow_auto_approve_in AND the run was created with auto_approve=True;
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
+from studio.core.canonical import canonical_json
 from studio.core.clock import Clock
 from studio.core.ids import Ids, UlidIds
 from studio.db.connection import Database
@@ -20,10 +22,12 @@ from studio.domain.enums import GateKind, Profile, RunStatus, Scope
 from studio.domain.errors import GatePolicyError
 from studio.domain.models import GateRow
 from studio.domain.refs import SubjectRef, subjects_related
+from studio.pipeline.checklist import normalize_checklist
 from studio.pipeline.dag import Dag
 from studio.pipeline.subjects import shot_subject
 
 _SHEETS_STAGE = "s8a_character_sheets"
+_RENDER_QC_STAGE = "s12_render_qc"
 
 
 @dataclass(frozen=True)
@@ -59,6 +63,7 @@ class GateService:
         profile: str,
         auto_approve: bool,
         allow_auto_approve_in: list[Profile],
+        presented: dict[str, object] | None = None,
     ) -> tuple[GateRow, bool]:
         """Returns (gate, auto_approved). Raises GatePolicyError on policy violations."""
         if auto_approve:
@@ -82,10 +87,21 @@ class GateService:
             subject_id=subject_id,
             round=round_no,
             snapshot_hash=snapshot_hash,
+            presented_json=(canonical_json(presented).decode() if presented is not None else None),
         )
         if auto_approve:
+            # Phase 5 §J: a machine-filled G3 checklist is recorded as such;
+            # S13's final blockers later refuse auto-made attestations.
+            auto_checklist = (
+                canonical_json(normalize_checklist(None, profile=profile, auto=True)).decode()
+                if gate is GateKind.G3_FINAL_CUT
+                else None
+            )
             decided = self.repos.gates.decide(
-                created.id, status="auto_approved", note="auto-approved (profile policy)"
+                created.id,
+                status="auto_approved",
+                note="auto-approved (profile policy)",
+                checklist_json=auto_checklist,
             )
             assert decided is not None
             self.repos.audit.append(
@@ -112,9 +128,27 @@ class GateService:
 
     # ---- decisions -----------------------------------------------------------
 
-    def approve(self, gate_id: str, note: str | None = None) -> GateRow:
+    def approve(
+        self,
+        gate_id: str,
+        note: str | None = None,
+        checklist: dict[str, object] | None = None,
+    ) -> GateRow:
         gate = self._pending_gate(gate_id)
-        decided = self.repos.gates.decide(gate.id, status="approved", note=note)
+        checklist_json: str | None = None
+        if gate.gate == GateKind.G3_FINAL_CUT.value:
+            run = self.repos.pipeline.get_run(gate.run_id)
+            profile = run.profile if run is not None else Profile.FINAL.value
+            checklist_json = canonical_json(
+                normalize_checklist(checklist, profile=profile, auto=False)
+            ).decode()
+        elif checklist:
+            raise GatePolicyError(
+                f"gate {gate_id} ({gate.gate}) does not take an approval checklist"
+            )
+        decided = self.repos.gates.decide(
+            gate.id, status="approved", note=note, checklist_json=checklist_json
+        )
         assert decided is not None
         self.repos.audit.append(
             actor="operator",
@@ -126,6 +160,11 @@ class GateService:
                 "gate": gate.gate,
                 "round": gate.round,
                 "note": note,
+                "checklist": (
+                    normalize_checklist(json.loads(checklist_json), profile="draft")
+                    if checklist_json
+                    else None
+                ),
             },
         )
         self._after_gate_approved(decided)

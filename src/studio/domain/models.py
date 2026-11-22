@@ -344,6 +344,9 @@ class GateRow(_Row):
     note: str | None
     created_at: str
     decided_at: str | None
+    # Phase 5 (migration 007): G3 checklist + frozen presented panel.
+    checklist_json: str | None = None
+    presented_json: str | None = None
 
 
 class AuditEventRow(_Row):

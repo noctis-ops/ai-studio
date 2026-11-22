@@ -201,3 +201,30 @@ class VisualQcError(StudioError):
 
 class FailedPolicy(StudioError):
     """Sanitizer exhausted ``max_levels``; the shot parks for a human."""
+
+
+# ---- Phase 5 ---------------------------------------------------------------
+
+
+class GeometryError(StudioError):
+    """A clip's geometry cannot be conformed to the destination tolerance."""
+
+
+class InsufficientDisk(StudioError):
+    """Free disk is below ``assemble.min_free_disk_factor`` x the estimated need."""
+
+
+class EncoderUnavailable(StudioError):
+    """The requested encoder is missing or failed its probe (fail closed)."""
+
+
+class EpisodeClosed(StudioError):
+    """The episode is published/archived: paid stages are refused (§S15)."""
+
+
+class AssetPurged(StudioError):
+    """A cache hit points at a purged asset; fail closed, call no provider (§H5.6)."""
+
+
+class ExportNotReady(StudioError):
+    """An export was requested for a deliverable with no approved render."""

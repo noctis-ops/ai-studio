@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .channels import ChannelsConfig, load_channels_file
+from .presets import ExportPresets, load_export_presets_file
 from .registry import ModelRegistry, load_registry_file
 from .settings import Settings, load_settings_file_with_report
 from .vocab import Vocab, load_vocab_file
@@ -21,6 +22,7 @@ class AppConfig:
     registry: ModelRegistry
     vocab: Vocab
     channels: ChannelsConfig
+    presets: ExportPresets
     # H5.1: deprecated keys that were accepted-and-ignored (audit + doctor rows).
     config_notes: tuple[str, ...] = ()
 
@@ -36,11 +38,13 @@ def load_all(home: Path) -> AppConfig:
     registry = load_registry_file(registry_path)
     vocab = load_vocab_file(vocab_path)
     channels = load_channels_file(channels_path)
+    presets = load_export_presets_file(home / "configs" / "export_presets.yaml", channels=channels)
     return AppConfig(
         home=home,
         settings=settings,
         registry=registry,
         vocab=vocab,
         channels=channels,
+        presets=presets,
         config_notes=tuple(notes),
     )
