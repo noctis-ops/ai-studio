@@ -156,3 +156,35 @@ def test_assemble_plan_free_space_is_injectable(tmp_path, monkeypatch):
         assert AssembleHandler().subjects(ctx)
 
     asyncio.run(scenario())
+
+
+def test_gate_02_no_paid_stage_has_a_final_cut_ancestor():
+    """T-GATE-02: a `G3_FINAL_CUT` gate may never sit upstream of a paid stage.
+
+    This is the static proof behind the F5 finding: the operator is asked to
+    review a final cut on a *render*, and no spend can happen while that review
+    is pending.
+    """
+    from studio.domain.enums import GateKind
+    from studio.pipeline.dag import Dag
+    from studio.pipeline.specs import production_specs, text_specs
+
+    specs = production_specs()
+    dag = Dag(specs)
+    gates = {spec.name: spec.gate_after for spec in specs}
+    paid = [spec.name for spec in specs if spec.spends_money]
+    assert paid, "the production DAG must have paid stages"
+    for name in paid:
+        for ancestor in dag.ancestors(name):
+            assert gates.get(ancestor) != GateKind.G3_FINAL_CUT, (
+                f"paid stage {name} has a final-cut gate on {ancestor}"
+            )
+    # The final cut lives on the render QC stage, and its rejection re-runs the
+    # free assembly rather than any paid stage.
+    render = dag.spec("s12_render_qc")
+    assert render.gate_after == GateKind.G3_FINAL_CUT
+    assert render.gate_reject_stage == "s11_assemble"
+    assert render.spends_money is False
+    # The text DAG's metadata review is a script gate, never a cut gate.
+    text_gates = {spec.name: spec.gate_after for spec in text_specs()}
+    assert all(kind != GateKind.G3_FINAL_CUT for kind in text_gates.values())

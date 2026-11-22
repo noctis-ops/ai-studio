@@ -29,8 +29,8 @@ publish/purge (S15) are Stage B and are **not** in this checkpoint.
   rejection re-runs `s11_assemble` (free) and produces a new render sha.
 - `metadata_safety` carries `G1_SCRIPT`, not `G3_FINAL_CUT`: the operator is
   never asked to approve a "final cut" before any media exists (F5/C1).
-- No paid stage has a `G3_FINAL_CUT` ancestor (T-GATE-02 basis; the static
-  assertion lands with the S13/S14 rewiring step).
+- No paid stage has a `G3_FINAL_CUT` ancestor — asserted statically over the
+  production and text DAGs (T-GATE-02), so the F5 finding cannot regress.
 
 ## S11 — assemble
 
@@ -120,6 +120,8 @@ studio encode probe
   and G3 CLI checklist behaviour.
 - `tests/test_phase5_animatic.py` (15), `tests/test_phase5_video.py` (35),
   `tests/test_phase4_flow.py` — updated for the G3 park at the end of the chain.
+- `tests/test_phase5_floors.py` also carries T-GATE-02 (static DAG: no paid
+  stage has a final-cut gate above it; G3 sits on S12 and rejects into S11).
 - `tests/test_phase5_cli_coverage.py`, `tests/test_phase5_floors.py`,
   `tests/test_phase5_coverage_lift3.py` — the CLI surface end to end, the
   panel/assemble/QC error paths, and `media/clips.py`'s fail-closed preflight.
