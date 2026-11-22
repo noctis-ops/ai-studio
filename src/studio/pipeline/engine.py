@@ -26,7 +26,7 @@ from studio.core.ids import Ids, UlidIds
 from studio.db.connection import Database
 from studio.db.repos import StudioRepos
 from studio.db.repos.pipeline import subject_from_stage_run
-from studio.domain.enums import RunStatus
+from studio.domain.enums import GateKind, RunStatus
 from studio.domain.errors import (
     BudgetExceeded,
     ProviderQuotaExceeded,
@@ -99,6 +99,13 @@ class Engine:
                 max_polls=1000,
             )
         return self._gateway
+
+    def context_for(self, run_id: str) -> RunContext:
+        """Public read-only context (gate panel, previews, doctor-style reports)."""
+        run = self.repos.pipeline.get_run(run_id)
+        if run is None:
+            raise StudioError(f"unknown run: {run_id}")
+        return self._context(run, None)
 
     def _context(self, run: PipelineRunRow, stage_run_id: str | None) -> RunContext:
         from studio.pipeline.context import RunContext
@@ -359,6 +366,7 @@ class Engine:
         allow = list(self.config.settings.gates.allow_auto_approve_in)
         run = self.repos.pipeline.get_run(run_id)
         assert run is not None
+        presented = self._presented_panel(run_id, spec, gate_kind)
         try:
             _gate, auto_approved = self.gates.create_gate_round(
                 run_id=run_id,
@@ -368,6 +376,7 @@ class Engine:
                 profile=run.profile,
                 auto_approve=bool(run.auto_approve),
                 allow_auto_approve_in=allow,
+                presented=presented,
             )
         except StudioError:
             logger.exception("gate creation failed for %s/%s", run_id, spec.name)
@@ -377,6 +386,35 @@ class Engine:
             return False
         self.repos.pipeline.set_run_status(run_id, RunStatus.AWAITING_APPROVAL.value)
         return True
+
+    def _presented_panel(
+        self, run_id: str, spec: StageSpec, gate_kind: GateKind
+    ) -> dict[str, object] | None:
+        """Freeze the mutable review panel onto the gate row (§G4).
+
+        Mutable numbers (spend, caps, drift) must never reach the stage output
+        or the snapshot hash, so they are captured here, once, for audit.
+        Presentation must never block a gate: any failure yields no panel.
+        """
+        if gate_kind not in (GateKind.G2_KEYFRAMES, GateKind.G3_FINAL_CUT):
+            return None
+        from studio.pipeline.panel import panel_for_new_gate
+
+        try:
+            ctx = self.context_for(run_id)
+            round_no = self.repos.gates.count_rounds(run_id, spec.name) + 1
+            return dict(
+                panel_for_new_gate(
+                    ctx,
+                    run_id=run_id,
+                    gate=gate_kind.value,
+                    stage=spec.name,
+                    round_no=round_no,
+                )
+            )
+        except Exception:  # the panel is advisory; never fail the gate for it
+            logger.exception("gate panel failed for %s/%s", run_id, spec.name)
+            return None
 
     @staticmethod
     def _gate_snapshot_hash(rows: list[StageRunRow]) -> str:

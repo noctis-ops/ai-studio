@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -1042,22 +1043,187 @@ def gates_approve(
 @gates_app.command("reject")
 def gates_reject(
     gate_id: str = typer.Argument(...),
-    shot: str = typer.Option(..., "--shot", help="Shot id to reject."),
+    shot: str | None = typer.Option(None, "--shot", help="Shot id to reject."),
+    shots: str | None = typer.Option(
+        None, "--shots", help="Comma-separated shot numbers, e.g. 3,7 (G2)."
+    ),
+    all_shots: bool = typer.Option(False, "--all", help="Reject every shot (shows cost)."),
     prompt: str | None = typer.Option(None, "--prompt", help="Edited prompt for the next attempt."),
     note: str | None = typer.Option(None, "--note"),
+    reason: str | None = typer.Option(None, "--reason", help="Alias of --note."),
+    yes: bool = typer.Option(False, "--yes", help="Confirm the paid regeneration."),
 ) -> None:
-    """Reject a shot's output at a gate; the stage re-executes."""
-    _, db, clock, ids, repos = _connect()
+    """Reject output at a gate; the stage re-executes.
+
+    G2 accepts shot numbers (`--shots 3,7`) or `--all`; both show the expected
+    keyframe cost and require `--yes`, because only those shots are re-paid.
+    """
+    config, db, clock, ids, repos = _connect()
     dag = _dag_for_gate(repos, gate_id)
     service = GateService(db, repos, clock, dag, ids)
+    note = note or reason
+    rejections = []
+    if shot:
+        rejections.append(ShotRejection(shot_id=shot, edited_prompt=prompt))
+    if shots or all_shots:
+        gate = repos.gates.get(gate_id)
+        run = repos.pipeline.get_run(gate.run_id) if gate is not None else None
+        if gate is None or run is None or not run.episode_id:
+            _fail(f"gate {gate_id} has no resolvable run/episode")
+        targets = _reject_shot_rows(repos, run.episode_id, shots, all_shots)
+        if not targets:
+            _fail("no shots matched")
+        engine = Engine(
+            db=db, repos=repos, dag=dag, clock=clock, config=config, ids=ids,
+            llm_subset_only=False,
+        )
+        from studio.pipeline.panel import gate_panel, keyframe_reject_cost
+
+        ctx = engine.context_for(run.id)
+        cost = keyframe_reject_cost(ctx, [row.id for row in targets])
+        console.print(
+            f"rejecting {len(targets)} shot(s): "
+            + ", ".join(str(row.shot_no) for row in targets)
+        )
+        if cost["available"]:
+            with_retries = musd_to_usd(int(cost["with_retries_musd"] or 0))
+            first_pass = musd_to_usd(int(cost["first_pass_musd"] or 0))
+            console.print(
+                f"expected keyframe cost: {with_retries:.4f} USD "
+                f"(first pass {first_pass:.4f} USD)"
+            )
+        else:
+            console.print("[yellow]cost not computable offline for every shot[/yellow]")
+        if not yes:
+            _fail("rejecting shots re-pays their keyframes; re-run with --yes")
+        rejections.extend(
+            ShotRejection(shot_id=row.id, edited_prompt=prompt) for row in targets
+        )
+        _ = gate_panel  # panel is what `gates show` renders from the same context
+    if not rejections:
+        _fail("nothing to reject: pass --shot <id>, --shots 3,7 or --all")
     try:
-        service.request_changes(gate_id, note, [ShotRejection(shot_id=shot, edited_prompt=prompt)])
+        service.request_changes(gate_id, note, rejections)
     except StudioError as exc:
         _fail(str(exc))
     _hint = " --production" if _is_text_gate(repos, gate_id) else ""
     console.print(
         f"gate {gate_id} marked changes_requested; next: studio worker --until-idle{_hint}"
     )
+
+
+def _reject_shot_rows(  # type: ignore[no-untyped-def]
+    repos, episode_id: str, shots: str | None, all_shots: bool
+) -> list[Any]:
+    """Resolve `--shots 3,7` (shot numbers) or `--all` for this episode."""
+    tracks = repos.content.list_tracks(episode_id)
+    rows = [shot for track in tracks for shot in repos.content.shots_for_track(track.id)]
+    if all_shots:
+        return rows
+    wanted: set[int] = set()
+    for chunk in (shots or "").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            wanted.add(int(chunk))
+        except ValueError:
+            _fail(f"--shots expects shot numbers, got {chunk!r}")
+    missing = wanted - {row.shot_no for row in rows}
+    if missing:
+        _fail(f"unknown shot number(s): {', '.join(str(n) for n in sorted(missing))}")
+    return [row for row in rows if row.shot_no in wanted]
+
+
+@gates_app.command("show")
+def gates_show(
+    gate_id: str = typer.Argument(...),
+    as_json: bool = typer.Option(False, "--json", help="Print the panel as JSON."),
+) -> None:
+    """Show the gate panel: estimates, spend, clip projection, caps, verdict."""
+    from studio.pipeline.panel import gate_panel
+
+    config, db, clock, ids, repos = _connect()
+    gate = repos.gates.get(gate_id)
+    if gate is None:
+        _fail(f"unknown gate {gate_id}")
+    dag = _dag_for_run(repos, gate.run_id)
+    engine = Engine(
+        db=db, repos=repos, dag=dag, clock=clock, config=config, ids=ids,
+        llm_subset_only=False,
+    )
+    try:
+        panel = gate_panel(engine.context_for(gate.run_id), gate_id)
+    except StudioError as exc:
+        _fail(str(exc))
+    if as_json:
+        console.print_json(json.dumps(panel, ensure_ascii=False, sort_keys=True))
+        return
+    verdict = str(panel["verdict"])
+    colour = {"ok": "green", "over_remaining_cap": "red"}.get(verdict, "yellow")
+    console.print(
+        f"gate [bold]{gate_id}[/bold] · {gate.gate} on {gate.stage} · round {gate.round}"
+        f" · status {gate.status} · verdict [{colour}]{verdict}[/{colour}]"
+    )
+    estimates = panel.get("estimates") or []
+    if estimates:
+        table = Table(title="S4 media estimate (USD, low / expected / high)")
+        for column in ("deliverable", "tts", "sheets", "keyframes", "video"):
+            table.add_column(column)
+        for entry in estimates:
+            buckets = entry["buckets"]
+            table.add_row(
+                str(entry["deliverable_id"])[:12],
+                *[
+                    "{:.4f} / {:.4f} / {:.4f}".format(
+                        musd_to_usd(int(buckets[name]["low_musd"] or 0)),
+                        musd_to_usd(int(buckets[name]["expected_musd"] or 0)),
+                        musd_to_usd(int(buckets[name]["high_musd"] or 0)),
+                    )
+                    for name in ("tts", "sheets", "keyframes", "video")
+                ],
+            )
+        console.print(table)
+    elif not panel.get("estimates_available", False):
+        console.print("[yellow]media estimate unavailable (unconfirmed model or price)[/yellow]")
+    spend = panel.get("spend") or {}
+    console.print(
+        f"spent to date: {musd_to_usd(int(spend.get('total_musd') or 0)):.4f} USD"
+    )
+    for row in spend.get("by_model") or []:
+        console.print(
+            f"  {row['capability']:<10} {row['model_key']:<28} calls={row['calls']:<4}"
+            f" spent={musd_to_usd(int(row['spent_musd'])):.4f}"
+            f" est={musd_to_usd(int(row['est_musd'])):.4f}"
+        )
+    projection = panel.get("clip_projection") or {}
+    console.print(
+        "clip projection: "
+        + (
+            "not computable (locked durations or price missing)"
+            if not projection.get("available")
+            else f"first pass {musd_to_usd(int(projection['first_pass_musd'] or 0)):.4f} USD,"
+            f" with retries {musd_to_usd(int(projection['with_retries_musd'] or 0)):.4f} USD"
+        )
+    )
+    for scope, cap in (panel.get("caps") or {}).items():
+        remaining = cap.get("remaining_musd")
+        cap_text = (
+            "none"
+            if cap.get("cap_musd") is None
+            else f"{musd_to_usd(int(cap['cap_musd'])):.4f}"
+        )
+        console.print(
+            f"  {scope:<8} cap="
+            + cap_text
+            + " remaining="
+            + ("n/a" if remaining is None else f"{musd_to_usd(int(remaining)):.4f}")
+        )
+    for entry in panel.get("drift") or []:
+        flag = "[yellow]WARN[/yellow]" if entry["warn"] else "ok"
+        console.print(
+            f"  drift {entry['bucket']}: {entry['drift_pct']:+.1f}% vs S4 baseline ({flag})"
+        )
 
 
 # ==================================================================
@@ -1350,11 +1516,13 @@ def _dag_for_run(repos: StudioRepos, run_id: str) -> Dag:
         rows = repos.pipeline.list_stage_runs(run_id)
     except Exception:  # diagnostics only; never block the operator
         rows = []
-    if any(row.stage in _TEXT_STAGES for row in rows):
-        from studio.pipeline.specs import production_specs
+    demo = _demo_specs_light()
+    demo_names = {spec.name for spec in demo}
+    if rows and all(row.stage in demo_names for row in rows):
+        return Dag(demo)
+    from studio.pipeline.specs import production_specs
 
-        return Dag(production_specs())
-    return Dag(_demo_specs_light())
+    return Dag(production_specs())
 
 
 def _is_text_gate(repos: StudioRepos, gate_id: str) -> bool:
@@ -2256,6 +2424,90 @@ code {{ background: #0b1220; padding: 0.1rem 0.3rem; border-radius: 4px; }}
 """
 
 
+def _render_animatic(  # type: ignore[no-untyped-def]
+    db, repos, cas, outdir: Path, run_id: str, config, clock, ids
+) -> str:
+    """§G5: <video> per deliverable, a shot table and the frozen G2 panel.
+
+    Every string is HTML-escaped and narration text carries dir="auto".
+    """
+    from studio.pipeline.panel import gate_panel
+
+    rows = [
+        row
+        for row in repos.pipeline.list_stage_runs(run_id, stage="s9_animatic")
+        if row.status == "succeeded" and row.output_json
+    ]
+    if not rows:
+        return '<p class="muted">no animatic yet: run S9 (studio worker --until-idle)</p>'
+    engine = Engine(
+        db=db, repos=repos, dag=_dag_for_run(repos, run_id), clock=clock,
+        config=config, ids=ids, llm_subset_only=False,
+    )
+    ctx = engine.context_for(run_id)
+    gate = repos.gates.latest(run_id, "s9_animatic")
+    panel_html = ""
+    if gate is not None:
+        try:
+            panel = gate_panel(ctx, gate.id)
+        except StudioError:
+            panel = None
+        if panel is not None:
+            panel_html = (
+                '<h2>gate panel</h2><table><tr><th>verdict</th><td dir="auto">'
+                f"{_escape(str(panel['verdict']))}</td></tr>"
+                "<tr><th>spent (USD)</th><td>"
+                f"{musd_to_usd(int(panel['spend']['total_musd'])):.4f}</td></tr>"
+                f"<tr><th>clip projection</th><td dir=\"auto\">"
+                f"{_escape(json.dumps(panel['clip_projection'], ensure_ascii=False))}</td></tr>"
+                "</table>"
+            )
+    parts: list[str] = [panel_html]
+    for row in rows:
+        output = json.loads(row.output_json or "{}")
+        sha = str(output.get("animatic_sha256") or "")
+        if not sha:
+            continue
+        source = cas.resolve(sha)
+        target = outdir / f"animatic-{sha[:12]}.mp4"
+        if not target.exists():
+            shutil.copy2(source, target)
+        frames = output.get("frames")
+        shots = output.get("shots") or []
+        parts.append(
+            f"<h2>deliverable <code>{_escape(str(output.get('deliverable_id')))}</code>"
+            f" · {frames} frames · canvas {output.get('canvas')}</h2>"
+            f'<video controls preload="metadata" width="360" '
+            f'src="{_escape(target.name)}"></video>'
+            '<table id="shots"><tr><th>#</th><th>shot</th><th>start</th>'
+            "<th>frames</th><th>narration</th></tr>"
+        )
+        for shot in shots:
+            narration = " ".join(
+                str(line.get("text") or line.get("line_id") or "")
+                for line in shot.get("narration") or []
+            )
+            parts.append(
+                f'<tr data-start="{_escape(str(shot.get("start_ms")))}">'
+                f'<td>{_escape(str(shot.get("index")))}</td>'
+                f'<td><code>{_escape(str(shot.get("shot_id")))}</code></td>'
+                f'<td>{_escape(str(shot.get("start_ms")))} ms</td>'
+                f'<td>{_escape(str(shot.get("end_frame", 0)))}</td>'
+                f'<td dir="auto">{_escape(narration)}</td></tr>'
+            )
+        parts.append("</table>")
+    parts.append(
+        "<script>"
+        "document.querySelectorAll('video').forEach(function(v){"
+        "v.addEventListener('timeupdate',function(){"
+        "var t=v.currentTime*1000;var rows=document.querySelectorAll('#shots tr[data-start]');"
+        "rows.forEach(function(r){r.classList.toggle('current',"
+        "parseFloat(r.dataset.start)<=t && t<parseFloat(r.dataset.start)+4000);});"
+        "});});"
+        "</script>"
+    )
+    return "\n".join(parts)
+
 @media_app.command("preview")
 def media_preview(
     run_id: str = typer.Argument(..., help="Run id."),
@@ -2266,8 +2518,8 @@ def media_preview(
     """Write data/previews/<run_id>/<stage>.html (stdlib-only static page)."""
     stages = [stage.strip().lower()] if stage else ["sheets", "keyframes", "clips"]
     for item in stages:
-        if item not in ("sheets", "keyframes", "clips"):
-            _fail(f"--stage must be sheets|keyframes|clips, got {item!r}")
+        if item not in ("sheets", "keyframes", "clips", "animatic"):
+            _fail(f"--stage must be sheets|keyframes|clips|animatic, got {item!r}")
 
     config, db, clock, _ids, repos = _connect()
     migrate(db)
@@ -2304,6 +2556,8 @@ def media_preview(
             )
         elif item == "keyframes":
             body_parts.append(_render_attempts(db, cas, outdir, shots, tracks, "keyframe"))
+        elif item == "animatic":
+            body_parts.append(_render_animatic(db, repos, cas, outdir, run_id, config, clock, _ids))
         else:
             body_parts.append(_render_attempts(db, cas, outdir, shots, tracks, "clip"))
         target = outdir / f"{item}.html"

@@ -241,19 +241,20 @@ async def test_int_01_tts_receives_g1_approved_diacritized_text(
         any(ch in AR_DIACRITICS for ch in line.approved_text) for line in lines
     ), "expected the approved text to carry tashkeel"
 
-    # ---- Approve G1: run parks at G3 (metadata safety), still no TTS
+    # ---- Approve G1: run parks at the metadata review (a G1_SCRIPT round,
+    #      H5.7), still no TTS
     gates = GateService(env.db, env.repos, env.clock, env.dag, env.ids)
     gates.approve(g1[0]["id"], "script approved")
     await _drain(env.worker)
     # The operator scans the audio library before audio stages can run
     # (S7 fails closed with zero active music tracks), and scenes exist.
     _add_music_and_scene(env)
-    g3 = _gates(env.db, "G3_FINAL_CUT")
-    assert len(g3) == 1 and g3[0]["status"] == "pending"
+    g3 = [row for row in _gates(env.db, "G1_SCRIPT") if row["status"] == "pending"]
+    assert len(g3) == 1
     assert int(_tts_calls(env.db)) == 0
     assert env.spy.requests == []
 
-    # ---- Approve G3: s4p → s5a → s5 → s6 → s7 → s7b run (media waits at G0)
+    # ---- Approve the metadata review: s4p → s5a → s5 → s6 → s7 → s7b run
     gates.approve(g3[0]["id"], "metadata approved")
     await _drain(env.worker)
 

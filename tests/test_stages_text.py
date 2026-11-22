@@ -379,7 +379,7 @@ class _FlaggedMetadata(MockLLMProvider):
 
 
 @pytest.mark.asyncio
-async def test_s4_flagged_content_parks_at_g3(tmp_path, monkeypatch):
+async def test_s4_flagged_content_parks_at_metadata_review(tmp_path, monkeypatch):
     scripted = _FlaggedMetadata()
     env = _env(
         tmp_path, monkeypatch, filename="s4b", auto_approve=False,
@@ -398,10 +398,13 @@ async def test_s4_flagged_content_parks_at_g3(tmp_path, monkeypatch):
         "SELECT language, safety_status FROM deliverables"
     ).fetchall()
     assert deliverables and {row["safety_status"] for row in deliverables} == {"flagged"}
+    # H5.7: the metadata review is a G1_SCRIPT (text) approval; the run parks
+    # on the second G1 round, not on a final-cut gate.
     gates = env.db.connect().execute(
-        "SELECT gate, status FROM approval_gates WHERE gate = 'G3_FINAL_CUT'"
+        "SELECT gate, status FROM approval_gates WHERE stage = 'metadata_safety'"
     ).fetchall()
-    assert gates and all(row["status"] == "pending" for row in gates)
+    assert gates and all(row["gate"] == "G1_SCRIPT" for row in gates)
+    assert all(row["status"] == "pending" for row in gates)
     run = env.repos.pipeline.get_run(env.run_row.id)
     assert run is not None and run.status == RunStatus.AWAITING_APPROVAL.value
 
@@ -434,12 +437,12 @@ async def test_e2e_text_pipeline_parks_at_g1_then_completes(tmp_path, monkeypatc
     ).fetchone()[0]
     assert paid_ledger == 0
 
-    # approve G1 → drain → parked at G3 → approve → drain → completed
+    # approve G1 → drain → parked at the metadata review → approve → completed
     gates = GateService(env.db, env.repos, env.clock, Dag(text_specs()), env.ids)
     gates.approve(g1[0]["id"], "looks right")
     await _drain(env.worker)
     g3 = env.db.connect().execute(
-        "SELECT id FROM approval_gates WHERE gate = 'G3_FINAL_CUT' AND status = 'pending'"
+        "SELECT id FROM approval_gates WHERE gate = 'G1_SCRIPT' AND status = 'pending'"
     ).fetchall()
     assert len(g3) == 1
     gates.approve(g3[0]["id"], "ship it")

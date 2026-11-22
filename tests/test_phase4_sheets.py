@@ -56,7 +56,7 @@ def test_sht_01_all_approved_means_zero_calls_and_no_gate(tmp_path, monkeypatch)
         approve_parked(env, "G1_SCRIPT", note="script approved")
         await drain(env)
         add_music_and_scene(env)
-        approve_parked(env, "G3_FINAL_CUT", note="metadata approved")
+        approve_parked(env, "G1_SCRIPT", note="metadata approved")
         await drain(env)
 
     asyncio.run(run_chain())

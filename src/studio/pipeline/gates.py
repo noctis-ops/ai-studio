@@ -184,8 +184,13 @@ class GateService:
         if gate.stage == _SHEETS_STAGE:
             return self._request_changes_sheets(gate, note, rejections)
         affected: list[str] = []
-        downstream = sorted(self.dag.downstream(gate.stage))
-        stages_to_stale = {gate.stage, *downstream}
+        # Phase 5 (§E2): a G2 rejection re-runs the *keyframe* stage, not the
+        # animatic: only the named shots are re-paid, and the rebuilt animatic
+        # creates the next G2 round.
+        spec = self.dag.spec(gate.stage)
+        reject_stage = spec.gate_reject_stage or gate.stage
+        downstream = sorted(self.dag.downstream(reject_stage))
+        stages_to_stale = {reject_stage, *downstream}
         for rejection in rejections:
             shot = self.repos.content.get_shot(rejection.shot_id)
             if shot is None:

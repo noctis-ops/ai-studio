@@ -267,12 +267,12 @@ async def test_price_02_s6_emits_estimate_drift_past_warn_pct(tmp_path, monkeypa
     env.repos.pipeline.set_stage_run(row["id"], output_json=json.dumps(
         out, ensure_ascii=False, separators=(",", ":")))
 
-    _approve_parked(env, "G3_FINAL_CUT")
+    _approve_parked(env, "G1_SCRIPT")
     # The mutation invalidates the approval snapshot: the next advance
     # re-gates metadata_safety into a fresh pending round. Approve it too,
     # then let the audio chain run against the 1-musd baseline.
     await _drain(env.worker)
-    _approve_parked(env, "G3_FINAL_CUT")
+    _approve_parked(env, "G1_SCRIPT")
     await _drain(env.worker)  # audio chain runs; S6 performs the comparison
 
     drift_events = _audits(env.db, "estimate_drift")
@@ -298,7 +298,7 @@ def test_price_02_per_second_projection_uses_locked_durations(tmp_path, monkeypa
         await _drain(env.worker)
         _approve_parked(env, "G1_SCRIPT")
         await _drain(env.worker)
-        _approve_parked(env, "G3_FINAL_CUT")
+        _approve_parked(env, "G1_SCRIPT")
         await _drain(env.worker)
 
     import asyncio

@@ -195,7 +195,7 @@ async def test_pre_01_preflight_lists_every_problem_at_once(tmp_path, monkeypatc
     approve_parked(env, "G1_SCRIPT", note="script approved")
     await drain(env)
     add_music_and_scene(env)
-    approve_parked(env, "G3_FINAL_CUT", note="metadata approved")
+    approve_parked(env, "G1_SCRIPT", note="metadata approved")
     await drain(env)  # s4p runs and fails
     rows = stage_rows(env, "s4p_media_preflight")
     assert len(rows) == 1 and rows[0]["status"] == "failed"
@@ -242,7 +242,7 @@ async def test_pre_01_over_budget_halts_before_any_spend(tmp_path, monkeypatch):
     env.repos.budgets.reset_kill_switch("episode", episode_id, new_cap_musd=1)
 
     add_music_and_scene(env)
-    approve_parked(env, "G3_FINAL_CUT", note="metadata approved")
+    approve_parked(env, "G1_SCRIPT", note="metadata approved")
     await drain(env)  # s4p runs; the affordability guard halts the run
 
     run = env.repos.pipeline.get_run(env.run_row.id)
@@ -312,7 +312,7 @@ async def test_clp_02_changing_video_model_stales_s6(tmp_path, monkeypatch):
     approve_parked(env, "G1_SCRIPT", note="script approved")
     await drain(env)  # parked at G3; S6 has not run yet
     add_music_and_scene(env)
-    approve_parked(env, "G3_FINAL_CUT", note="metadata approved")
+    approve_parked(env, "G1_SCRIPT", note="metadata approved")
     await drain(env)  # S6 succeeded by now (run parked at G0)
     s6_row = [row for row in stage_rows(env, "s6_timing") if row["status"] == "succeeded"][-1]
     stored_hash = s6_row["input_hash"]
@@ -484,11 +484,11 @@ async def test_eng_15_no_paid_call_before_ancestor_gates(tmp_path, monkeypatch):
 
     approve_parked(env, "G1_SCRIPT", note="script approved")
     await drain(env)
-    assert pending_gates(env, "G3_FINAL_CUT")
+    assert pending_gates(env, "G1_SCRIPT")
     assert _paid_media_calls(env) == [], "no media spend before the G3 round"
 
     add_music_and_scene(env)
-    approve_parked(env, "G3_FINAL_CUT", note="metadata approved")
+    approve_parked(env, "G1_SCRIPT", note="metadata approved")
     await drain(env)
     assert pending_gates(env, "G0_CHARACTERS")
     assert len(provider_calls(env, capability="tts")) == line_count

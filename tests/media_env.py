@@ -281,19 +281,24 @@ def add_music_and_scene(env) -> str:
 
 
 async def run_to_g3(env) -> None:
-    """Drain to the G3 park (metadata safety), with music + scenes wired."""
+    """Drain to the metadata park, with music + scenes wired.
+
+    Phase 5 (H5.7): the metadata text review is re-kinded to ``G1_SCRIPT``
+    (it is a script approval, not a cut approval), so the run parks on the
+    *same kind* twice — round 1 is the script, round 2 is the metadata text.
+    """
     await drain(env)
     assert pending_gates(env, "G1_SCRIPT"), "expected the run to park at G1"
     approve_parked(env, "G1_SCRIPT", note="script approved")
     await drain(env)
     add_music_and_scene(env)
-    assert pending_gates(env, "G3_FINAL_CUT"), "expected the run to park at G3"
+    assert pending_gates(env, "G1_SCRIPT"), "expected the run to park at the metadata review"
 
 
 async def run_to_g0(env) -> None:
     """Drain through the audio chain to the G0 park (character sheets)."""
     await run_to_g3(env)
-    approve_parked(env, "G3_FINAL_CUT", note="metadata approved")
+    approve_parked(env, "G1_SCRIPT", note="metadata approved")
     await drain(env)
     assert pending_gates(env, "G0_CHARACTERS"), (
         "expected the run to park at G0 after sheet generation"
@@ -301,7 +306,7 @@ async def run_to_g0(env) -> None:
 
 
 async def run_to_g2(env) -> None:
-    """Drain through sheets (G0 approved) to the G2 park (keyframes)."""
+    """Drain through sheets (G0 approved) to the G2 park (the *animatic*, S9)."""
     await run_to_g0(env)
     approve_parked(env, "G0_CHARACTERS", note="sheets approved")
     await drain(env)
@@ -403,7 +408,7 @@ async def run_to_g2_preseeded(env) -> None:
     approve_parked(env, "G1_SCRIPT", note="script approved")
     await drain(env)
     add_music_and_scene(env)
-    approve_parked(env, "G3_FINAL_CUT", note="metadata approved")
+    approve_parked(env, "G1_SCRIPT", note="metadata approved")
     await drain(env)
     assert pending_gates(env, "G0_CHARACTERS") == []
     assert pending_gates(env, "G2_KEYFRAMES"), "expected the run to park at G2"

@@ -326,7 +326,7 @@ async def test_kf_02_unsupported_aspect_fails_preflight_closed(tmp_path, monkeyp
     approve_parked(env, "G1_SCRIPT", note="script approved")
     await drain(env)
     add_music_and_scene(env)
-    approve_parked(env, "G3_FINAL_CUT", note="metadata approved")
+    approve_parked(env, "G1_SCRIPT", note="metadata approved")
     await drain(env)  # s4p runs and fails closed
 
     rows = stage_rows(env, "s4p_media_preflight")
@@ -371,7 +371,7 @@ async def test_kf_02_aspect_qc_failure_never_retries(tmp_path, monkeypatch):
     approve_parked(env, "G1_SCRIPT", note="script approved")
     await drain(env)
     add_music_and_scene(env)
-    approve_parked(env, "G3_FINAL_CUT", note="metadata approved")
+    approve_parked(env, "G1_SCRIPT", note="metadata approved")
     await drain(env)  # s4p + audio + s8a (zero calls) + the first keyframe
 
     keyframe_calls = [
@@ -427,7 +427,7 @@ async def test_kf_03_black_image_retries_q1_q2_then_fails(tmp_path, monkeypatch)
     approve_parked(env, "G1_SCRIPT", note="script approved")
     await drain(env)
     add_music_and_scene(env)
-    approve_parked(env, "G3_FINAL_CUT", note="metadata approved")
+    approve_parked(env, "G1_SCRIPT", note="metadata approved")
     await drain(env)  # stops at the first keyframe's QC exhaustion (run failed)
     assert pending_gates(env, "G0_CHARACTERS") == []
 
@@ -512,7 +512,7 @@ async def test_kf_04_crash_resume_repays_nothing(tmp_path, monkeypatch):
     approve_parked(env, "G1_SCRIPT", note="script approved")
     await drain(env)
     add_music_and_scene(env)
-    approve_parked(env, "G3_FINAL_CUT", note="metadata approved")
+    approve_parked(env, "G1_SCRIPT", note="metadata approved")
     with pytest.raises(SimulatedCrash):
         await drain(env)  # mid-S8 crash: one keyframe call was paid
 

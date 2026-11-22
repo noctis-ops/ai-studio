@@ -28,6 +28,7 @@ from studio.db.migrate import MIGRATIONS_DIR
 from studio.db.repos import build_repos
 from studio.domain.enums import GateKind, Scope
 from studio.domain.errors import ConfigError, GatePolicyError
+from studio.domain.refs import SubjectRef
 from studio.pipeline.barrier import episode_closed_problem, free_stage_gate_problems
 from studio.pipeline.checklist import (
     REQUIRED_ITEMS,
@@ -412,13 +413,14 @@ def test_free_stage_gate_problems_uses_ancestors(tmp_path):
     assert free_stage_gate_problems(
         repos=repos, dag=dag, run_id=run.id, stage_id="s10p_clip_preflight"
     ) == []
-    # A succeeded gated ancestor without any gate round is a problem.
-    from studio.pipeline.subjects import shot_subject
+    # A succeeded gated ancestor without any gate round is a problem. Since
+    # Phase 5 the gated stage before S10p is S9 (the animatic), not S8.
+    from studio.domain.enums import Scope
 
     repos.pipeline.create_stage_run(
         run_id=run.id,
-        stage="s8_keyframes",
-        subject=shot_subject(series.id, episode.id, "trk-1", "shot1"),
+        stage="s9_animatic",
+        subject=SubjectRef(scope=Scope.DELIVERABLE, id="dlv-1"),
         status="succeeded",
     )
     problems = free_stage_gate_problems(

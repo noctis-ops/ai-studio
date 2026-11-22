@@ -6,7 +6,7 @@ Ordering and wiring (DAG registered by `text_specs()`):
     S2 narration_script  EPISODE      creative → light  tashkeel strip-equality gate
     S3 shot_plan         TRACK        llm_creative  writes shots rows (G1_SCRIPT gate)
     S4 metadata_safety   DELIVERABLE  llm_light     writes metadata_json + safety_status
-                                                     (G3_FINAL_CUT gate parks the run)
+                                                     (G1_SCRIPT gate parks the run)
 
 Design decisions (recorded in PHASE2_REPORT.md):
 
@@ -955,6 +955,8 @@ def text_specs() -> list[StageSpec]:
             scope=Scope.DELIVERABLE,
             depends_on=("shot_plan",),
             handler=MetadataSafetyHandler(),
-            gate_after=GateKind.G3_FINAL_CUT,
+            # H5.7: the metadata text review is a script approval, not a cut
+            # approval. G3_FINAL_CUT now hangs off S12 on the rendered file.
+            gate_after=GateKind.G1_SCRIPT,
         ),
     ]

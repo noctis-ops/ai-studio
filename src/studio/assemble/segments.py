@@ -174,6 +174,44 @@ async def _count_frames(path: Path) -> int | None:
         return None
 
 
+async def render_still_segment(
+    *,
+    src: Path,
+    out: Path,
+    frames: int,
+    plan: FitPlan,
+    profile: EncoderProfile,
+    fps: int,
+    timeout_s: float = 300.0,
+) -> Path:
+    """Hold a still image for exactly ``frames`` frames (animatic, S9).
+
+    Still inputs are RGB, and swscale's RGB->YUV default is not BT.709, so the
+    scale filter carries ``out_color_matrix=bt709`` (§E6 ⚠). No drawtext.
+    """
+    out.parent.mkdir(parents=True, exist_ok=True)
+    args = [
+        "-hide_banner",
+        "-loglevel", "error",
+        "-y",
+        "-loop", "1",
+        "-framerate", str(fps),
+        "-i", str(src),
+        "-vf", plan.filter_chain(out_color_matrix="bt709"),
+        "-an",
+        "-frames:v", str(frames),
+        "-r", str(fps),
+        *profile.args,
+        "-map_metadata", "-1",
+        str(out),
+    ]
+    await run_ffmpeg(args, timeout_s=timeout_s)
+    count = await frame_count(out)
+    if count != frames:
+        raise MediaToolError(f"still segment {out.name} has {count} frames, expected {frames}")
+    return out
+
+
 async def _concat_once(parts: list[Path], out: Path, *, work_dir: Path, timeout_s: float) -> None:
     """Codec-copy concat of <= max_inputs_per_graph parts into ``out``."""
     await asyncio.to_thread(work_dir.mkdir, parents=True, exist_ok=True)

@@ -23,6 +23,7 @@ from studio.pipeline.stages_audio import (
     TtsLineHandler,
     TtsPreflightHandler,
 )
+from studio.pipeline.stages_render import AnimaticHandler
 from studio.pipeline.stages_text import text_specs
 
 __all__ = ["audio_specs", "media_specs", "production_specs"]
@@ -75,7 +76,12 @@ def audio_specs() -> list[StageSpec]:
 
 
 def media_specs(*, after: tuple[str, ...] = ("s7b_audio_mix",)) -> list[StageSpec]:
-    """S8a (G0) → S8 (G2) → S10p → S10, appended after the audio chain."""
+    """S8a (G0) → S8 → S9 (G2) → S10p → S10, appended after the audio chain.
+
+    Phase 5 moved G2 from S8 to S9: the human reviews the *animatic* (real
+    stills at real timing over the real master), and rejecting there re-runs
+    only the named shots' keyframes (``gate_reject_stage``).
+    """
     return [
         StageSpec(
             name="s8a_character_sheets",
@@ -90,13 +96,22 @@ def media_specs(*, after: tuple[str, ...] = ("s7b_audio_mix",)) -> list[StageSpe
             scope=Scope.SHOT,
             depends_on=("s8a_character_sheets",),
             handler=KeyframeHandler(),
-            gate_after=GateKind.G2_KEYFRAMES,
+            gate_after=None,
             spends_money=True,
+        ),
+        StageSpec(
+            name="s9_animatic",
+            scope=Scope.DELIVERABLE,
+            depends_on=("s8_keyframes", "s7b_audio_mix"),
+            handler=AnimaticHandler(),
+            gate_after=GateKind.G2_KEYFRAMES,
+            spends_money=False,
+            gate_reject_stage="s8_keyframes",
         ),
         StageSpec(
             name="s10p_clip_preflight",
             scope=Scope.EPISODE,
-            depends_on=("s8_keyframes",),
+            depends_on=("s9_animatic",),
             handler=ClipPreflightHandler(),
             gate_after=None,
             spends_money=False,
@@ -131,6 +146,6 @@ def production_specs() -> list[StageSpec]:
 
     Appended after the terminal text stage(s), even though the
     metadata_safety G3 round currently sits there (§M / R4):
-    s4p → s5a → s5 → s6 → s7 → s7b → s8a(G0) → s8(G2) → s10p → s10.
+    s4p → s5a → s5 → s6 → s7 → s7b → s8a(G0) → s8 → s9(G2) → s10p → s10.
     """
     return [*text_specs(), *preflight_specs(), *audio_specs(), *media_specs()]
