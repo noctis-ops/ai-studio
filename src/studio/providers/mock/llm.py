@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any
 
 from studio.domain.enums import Language
@@ -110,6 +111,89 @@ def _mock_shot_plan(req: LLMRequest, digest: str) -> dict[str, Any]:
     }
 
 
+def _scene_ids_from(prompt: str) -> list[str]:
+    """Evidence ids the prompt offered, in order (the `scene_ids` array)."""
+
+    match = re.search(r'"scene_ids":\s*\[(.*?)\]', prompt, re.DOTALL)
+    if not match:
+        return []
+    return re.findall(r'"([^"\\]{1,64})"', match.group(1))
+
+
+def _mock_bible_update(req: LLMRequest) -> dict[str, Any]:
+    """A valid S14 proposal citing only ids the prompt allowed."""
+    ids = _scene_ids_from(req.prompt)
+    if not ids:
+        # No evidence to cite: an empty-but-shaped payload (still rejected as
+        # factless by the validator, which is the honest mock answer).
+        empty: list[Any] = []
+        return {
+            "new_characters": empty,
+            "character_changes": empty,
+            "locations": empty,
+            "plot_events": empty,
+            "unresolved_threads": empty,
+            "continuity_notes": empty,
+        }
+    first, last = ids[0], ids[-1]
+    version_match = re.search(r'"bible_version":\s*(\d+)', req.prompt)
+    # A name that cannot collide with one the bible already has: after an
+    # accepted proposal the same "new character" would be a schema violation.
+    version = int(version_match.group(1)) if version_match else 0
+    newcomer = "المرشد" if version == 0 else f"المرشد {version + 1}"
+    match = re.search(r'"known_characters":\s*\[(.*?)\]', req.prompt, re.DOTALL)
+    known = re.findall(r'"([^"\\]{1,80})"', match.group(1)) if match else []
+    changes: list[dict[str, Any]] = (
+        [
+            {
+                "name": known[0],
+                "change": "صار يثقُ بالغريبِ بعد أن أنقذه المرشد",
+                "evidence": [{"scene_id": first}],
+            }
+        ]
+        if known
+        else []
+    )
+    return {
+        "new_characters": [
+            {
+                "name": newcomer,
+                "description": "شيخُ الميناءِ الذي يعرفُ خرائطَ البحرِ عن ظهرِ قلبٍ",
+                "visual_tokens": ["عمامةٌ زرقاء", "عصًا خشبية"],
+                "arc": "يفصحُ عن اسمِ العاصفةِ في الحلقةِ القادمة",
+                "evidence": [{"scene_id": first}],
+            }
+        ],
+        "character_changes": changes,
+        "locations": [
+            {
+                "name": "رصيفُ المرشد",
+                "description": "خشبٌ مبلولٌ وفوانيسُ مطفأةٌ في آخرِ الميناء",
+                "evidence": [{"scene_id": last}],
+            }
+        ],
+        "plot_events": [
+            {
+                "summary": "نُور يلتقي المرشدَ عند الفجرِ فيسمعُ منه حكايةَ الفانوسِ الأول",
+                "evidence": [{"scene_id": first}, {"scene_id": last}],
+            }
+        ],
+        "unresolved_threads": [
+            {
+                "name": "اسمُ العاصفة",
+                "note": "لم يُقَل بعدُ؛ ذكره المرشدُ همسًا",
+                "evidence": [{"scene_id": last}],
+            }
+        ],
+        "continuity_notes": [
+            {
+                "text": "الفانوسُ النحاسيُّ يبقى مع نُور حتى آخرِ الحلقات",
+                "evidence": [{"scene_id": first}],
+            }
+        ],
+    }
+
+
 def _mock_metadata(digest: str) -> dict[str, Any]:
     return {
         "title": "فانوسُ الفجرِ — الحلقةُ الأولى",
@@ -144,6 +228,9 @@ class MockLLMProvider(MockBase):
             text = json.dumps(parsed, separators=(",", ":"), ensure_ascii=False)
         elif req.schema_name == "shot_plan":
             parsed = _mock_shot_plan(req, digest)
+            text = json.dumps(parsed, separators=(",", ":"), ensure_ascii=False)
+        elif req.schema_name == "bible_update":
+            parsed = _mock_bible_update(req)
             text = json.dumps(parsed, separators=(",", ":"), ensure_ascii=False)
         elif req.schema_name == "metadata_safety":
             parsed = _mock_metadata(digest)

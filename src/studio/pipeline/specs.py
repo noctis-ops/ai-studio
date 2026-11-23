@@ -24,6 +24,7 @@ from studio.pipeline.stages_audio import (
     TtsLineHandler,
     TtsPreflightHandler,
 )
+from studio.pipeline.stages_bible import BibleProposalHandler
 from studio.pipeline.stages_render import (
     AnimaticHandler,
     AssembleHandler,
@@ -31,7 +32,7 @@ from studio.pipeline.stages_render import (
 )
 from studio.pipeline.stages_text import text_specs
 
-__all__ = ["audio_specs", "media_specs", "production_specs"]
+__all__ = ["audio_specs", "bible_proposal_specs", "media_specs", "production_specs"]
 
 
 def audio_specs() -> list[StageSpec]:
@@ -176,11 +177,38 @@ def preflight_specs(*, after: tuple[str, ...] = ("metadata_safety",)) -> list[St
     ]
 
 
+def bible_proposal_specs(*, after: tuple[str, ...] = ("shot_plan",)) -> list[StageSpec]:
+    """S14 — bible proposals, episode scope, paid (§L).
+
+    Deliberately after S3 only: it reads the episode's scenes and the current
+    bible, and its single gated ancestor is `shot_plan` (G1). That keeps
+    T-GATE-02 true (no paid stage has a G3 ancestor) while still refusing to
+    spend before the script gate is approved.
+    """
+    return [
+        StageSpec(
+            name="s14_bible_proposals",
+            scope=Scope.EPISODE,
+            depends_on=after,
+            handler=BibleProposalHandler(),
+            gate_after=None,
+            spends_money=True,
+        )
+    ]
+
+
 def production_specs() -> list[StageSpec]:
     """Full production DAG.
 
-    Appended after the terminal text stage(s), even though the
-    metadata_safety G3 round currently sits there (§M / R4):
-    s4p → s5a → s5 → s6 → s7 → s7b → s8a(G0) → s8 → s9(G2) → s10p → s10 → s11.
+    Text (S1 → S2 → S3/G1 → S4) then the media/audio chain, S13, and S14 as a
+    side branch off S3:
+    s4p → s5a → s5 → s6 → s7 → s7b → s8a(G0) → s8 → s9(G2) → s10p → s10 →
+    s11 → s12(G3) → s13, plus s14 after s3.
     """
-    return [*text_specs(), *preflight_specs(), *audio_specs(), *media_specs()]
+    return [
+        *text_specs(),
+        *bible_proposal_specs(),
+        *preflight_specs(),
+        *audio_specs(),
+        *media_specs(),
+    ]

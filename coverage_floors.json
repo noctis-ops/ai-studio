@@ -89,6 +89,18 @@
     {
       "glob": "src/studio/export/*.py",
       "floor": 88.0
+    },
+    {
+      "glob": "src/studio/bible/*.py",
+      "floor": 88.0
+    },
+    {
+      "glob": "src/studio/pipeline/stages_bible.py",
+      "floor": 88.0
+    },
+    {
+      "glob": "src/studio/db/repos/proposals.py",
+      "floor": 88.0
     }
   ]
 }

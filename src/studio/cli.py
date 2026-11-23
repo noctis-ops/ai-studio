@@ -64,6 +64,11 @@ render_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(render_app, name="render")
+bible_app = typer.Typer(
+    help="Series Bible proposals (S14). Accepting one bumps the bible version.",
+    no_args_is_help=True,
+)
+app.add_typer(bible_app, name="bible")
 
 console = Console()
 err_console = Console(stderr=True)
@@ -1320,6 +1325,174 @@ def _reject_shot_rows(  # type: ignore[no-untyped-def]
     if missing:
         _fail(f"unknown shot number(s): {', '.join(str(n) for n in sorted(missing))}")
     return [row for row in rows if row.shot_no in wanted]
+
+
+# ======================================================================
+# bible proposals (S14)
+# ======================================================================
+
+
+def _episode_run(repos: StudioRepos, episode_id: str) -> str | None:
+    """The most recent run for an episode (a proposal needs a run context)."""
+    runs = [run for run in repos.pipeline.list_runs() if run.episode_id == episode_id]
+    return runs[-1].id if runs else None
+
+
+@bible_app.command("proposals")
+def bible_proposals_list(
+    episode: str | None = typer.Option(None, "--episode", help="Filter by episode id."),
+    status: str | None = typer.Option(None, "--status", help="pending|accepted|rejected|stale"),
+) -> None:
+    """List bible proposals (never applies anything)."""
+    _config, db, _clock, _ids, repos = _connect()
+    migrate(db)
+    if episode is not None:
+        rows = repos.proposals.list_for_episode(episode, status=status)
+    else:
+        sql = "SELECT * FROM bible_proposals"
+        params: list[object] = []
+        if status is not None:
+            sql += " WHERE status = ?"
+            params.append(status)
+        sql += " ORDER BY created_at, rowid"
+        rows = [
+            _proposal_row(row) for row in db.connect().execute(sql, params).fetchall()
+        ]
+    table = Table(title="bible proposals")
+    for column in ("id", "episode", "base", "status", "facts", "created"):
+        table.add_column(column)
+    for row in rows:
+        payload = json.loads(row.proposal_json or "{}")
+        facts = sum(len(value) for value in payload.values() if isinstance(value, list))
+        table.add_row(
+            row.id,
+            row.episode_id,
+            str(row.base_bible_version),
+            row.status,
+            str(facts),
+            row.created_at,
+        )
+    console.print(table)
+
+
+def _proposal_row(row: Any) -> Any:
+    from studio.domain.models import BibleProposalRow
+
+    return BibleProposalRow.model_validate(dict(row))
+
+
+@bible_app.command("show")
+def bible_proposals_show(
+    proposal_id: str = typer.Argument(..., help="Proposal id."),
+) -> None:
+    """Print one proposal, with its evidence, as stored."""
+    _config, db, _clock, _ids, repos = _connect()
+    migrate(db)
+    row = repos.proposals.get(proposal_id)
+    if row is None:
+        _fail(f"unknown proposal {proposal_id}")
+    console.print(
+        f"[bold]proposal[/bold] {row.id}  status={row.status}  "
+        f"base_bible_version={row.base_bible_version}  episode={row.episode_id}"
+    )
+    console.print(row.proposal_json)
+
+
+@bible_app.command("accept")
+def bible_proposals_accept(
+    proposal_id: str = typer.Argument(..., help="Proposal id."),
+    note: str = typer.Option("", "--note", help="Why it was accepted (audited)."),
+) -> None:
+    """Apply a pending proposal as a new bible version (refuses a stale base)."""
+    from studio.bible.proposal import accept_proposal
+    from studio.domain.errors import ProposalStale
+
+    config, db, clock, ids, repos = _connect()
+    migrate(db)
+    row = repos.proposals.get(proposal_id)
+    if row is None:
+        _fail(f"unknown proposal {proposal_id}")
+    run_id = _episode_run(repos, row.episode_id)
+    if run_id is None:
+        _fail(f"episode {row.episode_id} has no run; cannot build a context")
+    ctx = _run_context(config, db, clock, ids, repos, run_id)
+    try:
+        result = accept_proposal(ctx, proposal_id, actor=f"operator:{note[:80]}")
+    except ProposalStale as exc:
+        _fail(str(exc))
+    except StudioError as exc:
+        _fail(str(exc))
+    console.print(
+        f"accepted {result['proposal_id']}: bible is now v{result['version']}"
+        f" ({'new version' if result['created'] else 'unchanged content'})"
+    )
+
+
+@bible_app.command("reject")
+def bible_proposals_reject(
+    proposal_id: str = typer.Argument(..., help="Proposal id."),
+    reason: str = typer.Option("", "--reason", help="Why it was rejected (audited)."),
+) -> None:
+    """Reject a pending proposal; the bible is untouched."""
+    from studio.bible.proposal import reject_proposal
+
+    config, db, clock, ids, repos = _connect()
+    migrate(db)
+    row = repos.proposals.get(proposal_id)
+    if row is None:
+        _fail(f"unknown proposal {proposal_id}")
+    run_id = _episode_run(repos, row.episode_id)
+    ctx = _run_context(config, db, clock, ids, repos, run_id or "")
+    result = reject_proposal(ctx, proposal_id, reason=reason)
+    console.print(f"rejected {result['proposal_id']}")
+
+
+@bible_app.command("propose")
+def bible_propose(
+    episode: str = typer.Argument(..., help="Episode id."),
+    regenerate: bool = typer.Option(
+        False, "--regenerate", help="Spend on a fresh call instead of the cached one."
+    ),
+    yes: bool = typer.Option(False, "--yes", help="Confirmed: this action spends money."),
+) -> None:
+    """Ask the model for one bible proposal (paid; never auto-applied)."""
+    from studio.bible.proposal import estimate_cost, propose
+
+    config, db, clock, ids, repos = _connect()
+    migrate(db)
+    if repos.content.get_episode(episode) is None:
+        _fail(f"unknown episode {episode}")
+    run_id = _episode_run(repos, episode)
+    if run_id is None:
+        _fail(f"episode {episode} has no run; start one before proposing")
+    ctx = _run_context(config, db, clock, ids, repos, run_id)
+    musd, detail = estimate_cost(ctx)
+    console.print(f"bible proposal: {detail}")
+    cached_note = "" if regenerate else " (a resume of the same nonce is a cache hit)"
+    console.print(f"worst-case cost: ${musd_to_usd(musd):.4f}{cached_note}")
+    if not yes:
+        _fail("aborted (nothing spent) — re-run with --yes to proceed")
+    result = _run_async(propose(ctx, regenerate=regenerate))
+    console.print(
+        f"proposal {result['proposal_id']} ({result['facts']} facts, "
+        f"base v{result['base_bible_version']}) — pending operator review"
+    )
+
+
+def _run_context(
+    config: AppConfig,
+    db: Database,
+    clock: SystemClock,
+    ids: UlidIds,
+    repos: StudioRepos,
+    run_id: str,
+) -> Any:
+    """A RunContext for a CLI action that needs the gateway (never a stage run)."""
+    engine = Engine(
+        db=db, repos=repos, dag=_dag_for_run(repos, run_id), clock=clock,
+        config=config, ids=ids, llm_subset_only=False,
+    )
+    return engine.context_for(run_id)
 
 
 @app.command()

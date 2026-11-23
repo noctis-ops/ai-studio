@@ -228,3 +228,15 @@ class AssetPurged(StudioError):
 
 class ExportNotReady(StudioError):
     """An export was requested for a deliverable with no approved render."""
+
+
+class ProposalInvalid(StudioError):
+    """A bible proposal failed its strict schema/evidence validation (§L).
+
+    Raising this after the *second* paid attempt is what stops a bad schema
+    from looping: the operator regenerates deliberately, not the engine.
+    """
+
+
+class ProposalStale(StudioError):
+    """The bible version moved since the proposal's `base_bible_version`."""
