@@ -867,12 +867,20 @@ class RenderQcHandler:
             / f"s12_{subject.id}"
             / self.input_hash(ctx, subject)[:16]
         )
+        metadata: dict[str, Any] | None = None
+        if deliverable.metadata_json:
+            try:
+                parsed = json.loads(deliverable.metadata_json)
+            except ValueError:  # pragma: no cover - column is JSON-checked
+                parsed = None
+            metadata = parsed if isinstance(parsed, dict) else None
         report = await run_render_qc(
             render_path,
             settings=settings,
             preset=preset,
             expected_frames=int(render["frames"]),
             master_sha256=render.get("master_sha256"),
+            metadata=metadata,
             upstream=upstream_aggregate(
                 ctx, ctx.run_id, track_id=getattr(deliverable, "track_id", None)
             ),

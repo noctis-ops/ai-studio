@@ -38,6 +38,10 @@ class EpisodeRow(_Row):
     languages_json: str
     aspects_json: str
     created_at: str
+    # Phase 5 (migration 007): adaptation provenance + publish marker.
+    source_ref: str | None = None
+    source_license: str | None = None
+    published_at: str | None = None
 
 
 class TrackRow(_Row):
@@ -55,6 +59,9 @@ class DeliverableRow(_Row):
     created_at: str
     metadata_json: str | None = None
     safety_status: str = "pending"
+    # Phase 5: set by `studio publish mark`.
+    published_at: str | None = None
+    published_url: str | None = None
 
 
 class ShotRow(_Row):
@@ -112,6 +119,28 @@ class NarrationLineRow(_Row):
     def approved_text(self) -> str:
         """The text Gate 1 approved, overlaid by any operator post-gate edit."""
         return self.text_final if self.text_final is not None else self.text
+
+
+class ExportRow(_Row):
+    id: str
+    deliverable_id: str
+    render_asset_id: str
+    dir_path: str
+    profile: str
+    status: str
+    created_at: str
+
+
+class BibleProposalRow(_Row):
+    id: str
+    episode_id: str
+    series_id: str
+    base_bible_version: int
+    status: str
+    proposal_json: str
+    created_at: str
+    provider_call_id: str | None = None
+    decided_at: str | None = None
 
 
 class AssetRow(_Row):

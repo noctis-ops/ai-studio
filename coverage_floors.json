@@ -85,6 +85,10 @@
     {
       "glob": "src/studio/pipeline/stages_render.py",
       "floor": 88.0
+    },
+    {
+      "glob": "src/studio/export/*.py",
+      "floor": 88.0
     }
   ]
 }

@@ -8,6 +8,7 @@ the audio stages and, after them, the media stages (s4p → s5a → ... → s10)
 from __future__ import annotations
 
 from studio.domain.enums import GateKind, Scope
+from studio.export.stage import ExportHandler
 from studio.media.stages import (
     CharacterSheetHandler,
     ClipGenHandler,
@@ -80,7 +81,7 @@ def audio_specs() -> list[StageSpec]:
 
 
 def media_specs(*, after: tuple[str, ...] = ("s7b_audio_mix",)) -> list[StageSpec]:
-    """S8a (G0) → S8 → S9 (G2) → S10p → S10 → S11 → S12 (G3), after audio.
+    """S8a (G0) → S8 → S9 (G2) → S10p → S10 → S11 → S12 (G3) → S13.
 
     Phase 5 moved G2 from S8 to S9: the human reviews the *animatic* (real
     stills at real timing over the real master), and rejecting there re-runs
@@ -146,6 +147,17 @@ def media_specs(*, after: tuple[str, ...] = ("s7b_audio_mix",)) -> list[StageSpe
             gate_after=GateKind.G3_FINAL_CUT,
             gate_reject_stage="s11_assemble",
             spends_money=False,
+        ),
+        # S13 exports the approved render. Free, no LLM, no network — but the
+        # barrier demands G1, G0, G2 and G3 (on S12) before it may write a file.
+        StageSpec(
+            name="s13_export",
+            scope=Scope.DELIVERABLE,
+            depends_on=("s12_render_qc",),
+            handler=ExportHandler(),
+            gate_after=None,
+            spends_money=False,
+            requires_cleared_gates=True,
         ),
     ]
 

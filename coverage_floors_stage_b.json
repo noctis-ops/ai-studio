@@ -3,10 +3,6 @@
   "total_floor": 91.0,
   "floors": [
     {
-      "glob": "src/studio/export/*.py",
-      "floor": 88.0
-    },
-    {
       "glob": "src/studio/retention/*.py",
       "floor": 88.0
     },
@@ -21,11 +17,7 @@
     {
       "glob": "src/studio/pipeline/stages_bible.py",
       "floor": 88.0
-    },
-    {
-      "glob": "src/studio/export/stage.py",
-      "floor": 88.0
     }
   ],
-  "note": "Stage B (S13 export, S14 bible proposals, S15 publish/purge) rules. Not enforced until those modules exist: check_coverage_floors.py refuses a glob that matches no file, which is the whole point of the guard. Merge these back into coverage_floors.json in the commit that adds the modules. No floor value differs from the enforced file."
+  "note": "Stage B (S14 bible proposals, S15 publish/purge) rules. Not enforced until those modules exist: check_coverage_floors.py refuses a glob that matches no file, which is the whole point of the guard. Merge these back into coverage_floors.json in the commit that adds the modules. `src/studio/export/*.py` (including stage.py) moved back to the enforced file with S13; no floor value differs from it."
 }

@@ -14,6 +14,7 @@ from .audit import AuditRepo, SqliteAuditRepo
 from .bible import BibleRepo, SqliteBibleRepo
 from .budgets import BudgetsRepo, SqliteBudgetsRepo
 from .content import ContentRepo, SqliteContentRepo
+from .exports import ExportsRepo, SqliteExportsRepo
 from .gates import GatesRepo, SqliteGatesRepo
 from .jobs import JobsRepo, SqliteJobsRepo
 from .pipeline import PipelineRepo, SqlitePipelineRepo, subject_from_stage_run
@@ -27,6 +28,7 @@ __all__ = [
     "BibleRepo",
     "BudgetsRepo",
     "ContentRepo",
+    "ExportsRepo",
     "GatesRepo",
     "JobsRepo",
     "NewAudioCue",
@@ -41,6 +43,7 @@ __all__ = [
     "SqliteBibleRepo",
     "SqliteBudgetsRepo",
     "SqliteContentRepo",
+    "SqliteExportsRepo",
     "SqliteGatesRepo",
     "SqliteJobsRepo",
     "SqlitePipelineRepo",
@@ -65,6 +68,7 @@ class StudioRepos:
     content: ContentRepo
     audit: AuditRepo
     sheets: SheetsRepo
+    exports: ExportsRepo
 
 
 def build_repos(db: Database, clock: Clock, ids: Ids | None = None) -> StudioRepos:
@@ -80,4 +84,5 @@ def build_repos(db: Database, clock: Clock, ids: Ids | None = None) -> StudioRep
         content=SqliteContentRepo(db, clock, ids),
         audit=SqliteAuditRepo(db, clock, ids),
         sheets=SqliteSheetsRepo(db, clock, ids),
+        exports=SqliteExportsRepo(db, clock, ids),
     )

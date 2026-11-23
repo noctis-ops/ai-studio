@@ -1322,6 +1322,83 @@ def _reject_shot_rows(  # type: ignore[no-untyped-def]
     return [row for row in rows if row.shot_no in wanted]
 
 
+@app.command()
+def export(
+    run_id: str = typer.Argument(..., help="Run id."),
+    deliverable: str | None = typer.Option(
+        None, "--deliverable", help="Deliverable key (id, language or channel)."
+    ),
+    override_commercial_use: bool = typer.Option(
+        False, "--override-commercial-use",
+        help="Write the export despite unverified commercial use (audited).",
+    ),
+    reason: str | None = typer.Option(None, "--reason", help="Why the override exists."),
+) -> None:
+    """Export every approved render of a run (free: no provider, no network).
+
+    Final-profile runs need G1, G0, G2 and G3 all approved against the current
+    snapshots; a draft/sandbox run writes under `export.draft_root` and records
+    the same blockers as `export_flags` in the sidecar.
+    """
+    if override_commercial_use and not (reason or "").strip():
+        _fail("--override-commercial-use requires --reason (it is audited)")
+    config, db, clock, ids, repos = _connect()
+    migrate(db)
+    run = repos.pipeline.get_run(run_id)
+    if run is None:
+        _fail(f"unknown run {run_id}")
+    target: str | None = None
+    if deliverable is not None:
+        target = _deliverable_by_key(repos, run, deliverable)
+        if target is None:
+            _fail(f"unknown deliverable {deliverable!r} for run {run_id}")
+    imports = _export_imports()
+    engine = Engine(
+        db=db, repos=repos, dag=_dag_for_run(repos, run_id), clock=clock,
+        config=config, ids=ids, llm_subset_only=False,
+    )
+    ctx = engine.context_for(run_id)
+    handler = imports["ExportHandler"](
+        override_commercial_use=override_commercial_use,
+        override_reason=reason if override_commercial_use else None,
+    )
+    subjects = handler.subjects(ctx)
+    if target is not None:
+        subjects = [subject for subject in subjects if subject.id == target]
+    if not subjects:
+        _fail("no deliverable to export for this run")
+    failures = 0
+    table = Table(title=f"export — {run_id}")
+    table.add_column("deliverable")
+    table.add_column("profile")
+    table.add_column("directory")
+    table.add_column("flags")
+    for subject in subjects:
+        try:
+            output = _run_async(handler.run(ctx, subject)).output
+        except StudioError as exc:
+            failures += 1
+            console.print(f"[red]{subject.id}[/red]: {exc}")
+            continue
+        flags = output.get("export_flags") or []
+        table.add_row(
+            subject.id,
+            str(output.get("profile")),
+            str(output.get("dir_path")),
+            ", ".join(str(flag.get("code")) for flag in flags) or "-",
+        )
+    console.print(table)
+    if failures:
+        raise typer.Exit(code=1)
+
+
+def _export_imports() -> dict[str, Any]:
+    """Lazy import so `--help` stays fast and cycles stay out of module import."""
+    from studio.export.stage import ExportHandler
+
+    return {"ExportHandler": ExportHandler}
+
+
 @render_app.command("rebuild")
 def render_rebuild(
     run_id: str = typer.Argument(..., help="Run id."),
