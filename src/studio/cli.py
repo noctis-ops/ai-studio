@@ -37,8 +37,9 @@ from studio.pipeline.worker import Worker
 app = typer.Typer(
     add_completion=False,
     help=(
-        "AI Studio — Phase 3 (demo pipeline on mocks incl. the local audio engine; "
-        "operator-gated paid LLM subset)."
+        "AI Studio — Phase 5 (s9 animatic, s11 assembly, s12 render QC, s13 export, "
+        "s14 bible proposals, s15 publish/purge; mock demo by default, paid paths "
+        "are operator-gated)."
     ),
 )
 db_app = typer.Typer(help="Database commands.")
@@ -64,6 +65,16 @@ render_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(render_app, name="render")
+publish_app = typer.Typer(
+    help="Publish marker (S15): an export becomes a fact only when it is marked.",
+    no_args_is_help=True,
+)
+app.add_typer(publish_app, name="publish")
+purge_app = typer.Typer(
+    help="Purge (S15): plan is free, run deletes, gc cleans orphans. Dry run by default.",
+    no_args_is_help=True,
+)
+app.add_typer(purge_app, name="purge")
 bible_app = typer.Typer(
     help="Series Bible proposals (S14). Accepting one bumps the bible version.",
     no_args_is_help=True,
@@ -766,6 +777,10 @@ def doctor(
     except OSError as exc:
         checks.append((f"write access to {home / 'data'}", "FAIL", str(exc)))
 
+    # Phase 5 §N: export root writable, free disk, presets vs channels,
+    # retention settings, leftover export scratch.
+    checks.extend(_phase5_doctor_rows())
+
     table = Table(title="studio doctor")
     table.add_column("check")
     table.add_column("status")
@@ -779,6 +794,100 @@ def doctor(
     console.print(table)
     if failures:
         raise typer.Exit(code=1)
+
+
+def _phase5_doctor_rows() -> list[tuple[str, str, str]]:
+    """Doctor rows added by Phase 5 (§N): export, disk, presets, retention, scratch."""
+    import shutil as _shutil
+
+    rows: list[tuple[str, str, str]] = []
+    try:
+        app_config = load_all(_home())
+        settings = app_config.settings
+    except Exception as exc:
+        return [("phase 5 settings", "FAIL", str(exc)[:200])]
+
+    # 1. export root writable (the final root, and the draft root's parent).
+    for label, path in (
+        ("export.root", Path(settings.paths.home) / settings.export.root),
+        ("export.draft_root", Path(settings.paths.home) / settings.export.draft_root),
+    ):
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / ".doctor-write-test"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+            rows.append((f"{label} writable", "PASS", str(path)))
+        except OSError as exc:
+            rows.append((f"{label} writable", "FAIL", f"{path}: {exc}"))
+
+    # 2. free disk where renders land (warn under 5 GB, fail under 1 GB).
+    try:
+        usage = _shutil.disk_usage(Path(settings.paths.home))
+        free_gb = usage.free / 1024**3
+        status = "PASS" if free_gb >= 5 else ("WARN" if free_gb >= 1 else "FAIL")
+        rows.append(("free disk (renders/exports)", status, f"{free_gb:.1f} GB free"))
+    except OSError as exc:  # pragma: no cover - platform dependent
+        rows.append(("free disk (renders/exports)", "WARN", str(exc)[:160]))
+
+    # 3. presets vs channels: every channel key must have a matching preset.
+    try:
+        channels = set(app_config.channels.channels)
+        missing = sorted(channels - set(app_config.presets.channels))
+        extra = sorted(set(app_config.presets.channels) - channels)
+        if missing or extra:
+            rows.append(
+                (
+                    "presets vs channels",
+                    "FAIL",
+                    f"missing presets: {missing}; stale presets: {extra}",
+                )
+            )
+        else:
+            rows.append(
+                ("presets vs channels", "PASS", f"{len(channels)} channel keys, 4 presets")
+            )
+    except Exception as exc:
+        rows.append(("presets vs channels", "FAIL", str(exc)[:160]))
+
+    # 4. retention sanity: a raw window of 0 days purges everything on day one.
+    retention = settings.retention
+    small = [
+        name
+        for name, value in (
+            ("keep_raw_clips_days", retention.keep_raw_clips_days),
+            ("keep_narration_audio_days", retention.keep_narration_audio_days),
+            ("rejected_attempt_days", retention.rejected_attempt_days),
+        )
+        if int(value) < 1
+    ]
+    rows.append(
+        (
+            "retention windows",
+            "WARN" if small else "PASS",
+            f"raw clips {retention.keep_raw_clips_days}d, narration "
+            f"{retention.keep_narration_audio_days}d, rejected attempts "
+            f"{retention.rejected_attempt_days}d"
+            + (f" (zero: {', '.join(small)})" if small else ""),
+        )
+    )
+
+    # 5. leftover export scratch from a crashed run.
+    leftovers: list[str] = []
+    for root in (
+        Path(settings.paths.home) / settings.export.root,
+        Path(settings.paths.home) / settings.export.draft_root,
+    ):
+        if root.is_dir():
+            leftovers.extend(str(path) for path in root.rglob(".tmp-*") if path.is_dir())
+    rows.append(
+        (
+            "leftover export .tmp-* dirs",
+            "WARN" if leftovers else "PASS",
+            f"{len(leftovers)} leftover (removed by the next export)" if leftovers else "none",
+        )
+    )
+    return rows
 
 
 @db_app.command("migrate")
@@ -1493,6 +1602,165 @@ def _run_context(
         config=config, ids=ids, llm_subset_only=False,
     )
     return engine.context_for(run_id)
+
+
+# ======================================================================
+# publish marker + purge (S15)
+# ======================================================================
+
+
+@publish_app.command("mark")
+def publish_mark(
+    deliverable_id: str = typer.Argument(..., help="Deliverable id."),
+    url: str = typer.Option(..., "--url", help="Public URL the deliverable was published to."),
+    published_at: str | None = typer.Option(
+        None, "--published-at", help="ISO-8601 timestamp (default: now)."
+    ),
+    yes: bool = typer.Option(False, "--yes", help="Confirmed: this writes the published state."),
+) -> None:
+    """Record that a deliverable was published (needs a prior export)."""
+    from studio.retention.publish import mark_published
+
+    _config, db, clock, _ids, repos = _connect()
+    migrate(db)
+    if not yes:
+        _fail("aborted (nothing written) — re-run with --yes to record the publication")
+    try:
+        result = mark_published(
+            repos, deliverable_id=deliverable_id, url=url, published_at=published_at, clock=clock
+        )
+    except StudioError as exc:
+        _fail(str(exc))
+    console.print(
+        f"published {result['deliverable_id']} at {result['published_at']} -> {result['url']}"
+    )
+    if result["episode_published"]:
+        console.print(
+            f"[green]episode {result['episode_id']} is now published[/green]: "
+            "paid stages are closed, free stages (a re-export) still run"
+        )
+
+
+def _purge_plan_table(plan: Any) -> Table:
+    table = Table(title=f"purge plan — episode {plan.episode_id}")
+    table.add_column("class")
+    table.add_column("count", justify="right")
+    table.add_column("bytes", justify="right")
+    table.add_column("rule")
+    for row in plan.summary():
+        table.add_row(
+            str(row["class"]),
+            str(row["count"]),
+            f"{int(row['bytes']):,}",
+            "; ".join(str(rule) for rule in row["rules"])[:120],
+        )
+    table.add_row("[bold]total[/bold]", str(len(plan.items)), f"{plan.total_bytes:,}", "")
+    return table
+
+
+@purge_app.command("plan")
+def purge_plan_cmd(
+    episode: str = typer.Option(..., "--episode", help="Episode id."),
+) -> None:
+    """Show what a purge would delete for one episode. Deletes nothing."""
+    from studio.retention.plan import build_plan
+
+    config, db, clock, _ids, repos = _connect()
+    migrate(db)
+    try:
+        plan = build_plan(repos, db, episode_id=episode, settings=config.settings, clock=clock)
+    except StudioError as exc:
+        _fail(str(exc))
+    console.print(_purge_plan_table(plan))
+    reasons = ", ".join(
+        f"{name}={count}" for name, count in sorted(plan.protected_reasons.items())
+    )
+    console.print(f"protected: {plan.protected} asset(s) ({reasons or 'none'})")
+
+
+@purge_app.command("run")
+def purge_run_cmd(
+    episode: str = typer.Option(..., "--episode", help="Episode id."),
+    yes: bool = typer.Option(False, "--yes", help="Confirmed: this deletes files."),
+    allow_repay_purged: bool = typer.Option(
+        False,
+        "--allow-repay-purged",
+        help="Allow a future provider call to re-pay for a purged asset (audited).",
+    ),
+) -> None:
+    """Delete a published episode's purgeable assets (dry run unless --yes)."""
+    from studio.retention.plan import build_plan
+    from studio.retention.run import run_purge
+
+    config, db, clock, _ids, repos = _connect()
+    migrate(db)
+    try:
+        plan = build_plan(repos, db, episode_id=episode, settings=config.settings, clock=clock)
+    except StudioError as exc:
+        _fail(str(exc))
+    console.print(_purge_plan_table(plan))
+    if not yes:
+        result = run_purge(
+            repos, db, episode_id=episode, settings=config.settings, clock=clock, dry_run=True
+        )
+        console.print(
+            f"dry run: {len(result.deleted)} file(s), {result.deleted_bytes:,} bytes "
+            "would be deleted — re-run with --yes to delete"
+        )
+        return
+    if allow_repay_purged:
+        repos.audit.append(
+            actor="operator",
+            entity=f"episode:{episode}",
+            event="s15_purge_allow_repay",
+            payload={"note": "--allow-repay-purged acknowledged at purge time"},
+        )
+    try:
+        result = run_purge(
+            repos, db, episode_id=episode, settings=config.settings, clock=clock, dry_run=False
+        )
+    except StudioError as exc:
+        _fail(str(exc))
+    console.print(
+        f"deleted {len(result.deleted)} file(s), {result.deleted_bytes:,} bytes "
+        f"({', '.join(sorted({item.purge_class for item in result.deleted})) or 'nothing'})"
+    )
+    if result.newly_protected:
+        console.print(
+            f"[yellow]skipped {len(result.newly_protected)} asset(s) that became "
+            "protected while the plan was reviewed[/yellow]"
+        )
+    if result.missing:
+        console.print(f"already gone: {len(result.missing)} file(s) (resumable)")
+    if not result.ok:
+        console.print(
+            f"[red]locked, skipped: {len(result.skipped_locked)} file(s)[/red] "
+            "(a held handle; close the app and re-run)"
+        )
+        raise typer.Exit(code=1)
+
+
+@purge_app.command("gc")
+def purge_gc_cmd(
+    yes: bool = typer.Option(False, "--yes", help="Confirmed: this deletes orphans."),
+) -> None:
+    """Remove CAS orphans, data/tmp scratch and stale .tmp-* export directories."""
+    from studio.retention.run import run_gc
+
+    config, db, clock, _ids, repos = _connect()
+    migrate(db)
+    result = run_gc(
+        repos, db, settings=config.settings, clock=clock, dry_run=not yes
+    )
+    table = Table(title="purge gc" + (" (dry run)" if not yes else ""))
+    table.add_column("class")
+    table.add_column("candidates", justify="right")
+    table.add_column("removed", justify="right")
+    for key in result["candidates"]:
+        table.add_row(key, str(result["candidates"][key]), str(result["removed"][key]))
+    console.print(table)
+    if not yes:
+        console.print("dry run: nothing deleted — re-run with --yes to delete")
 
 
 @app.command()

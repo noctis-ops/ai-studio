@@ -1,10 +1,12 @@
-# AI Studio — Phase 4 (Media: fal.ai images/clips, visual QC, gates G0/G2)
+# AI Studio — Phase 5 (render, export, bible, retention)
 
 A local, single-operator pipeline that will orchestrate paid generative-AI APIs to
-produce cinematic animated videos. **Phase 4 ships the paid media path: a raw
-httpx fal.ai adapter (offline tests run on mocks), the s4p/s10p preflights, the
-S8a/S8/S10 stages, ffmpeg-backed visual QC, deterministic clip conform, gate
-G0 (characters) and G2 (keyframes), and the media CLI (preview/QC/audition/smoke).**
+produce cinematic animated videos. **Phase 5 completes the tail of the DAG: the
+S9 animatic (gate G2), the S11 assembly, the S12 render QC (gate G3), the S13
+free export (MP4 + sidecar + thumbnail candidates), the S14 series-bible
+proposals and the S15 publish marker / retention purge.** The paid media path
+(Phase 4: raw httpx fal.ai adapter, s4p/s10p preflights, S8a/S8/S10, visual QC,
+deterministic conform, gates G0/G2) is unchanged and still mock-only in tests.
 The demo pipeline runs on mock providers, and that is what the test suite
 exercises. Nothing here spends real money until the fal endpoints, prices and
 licences in `configs/model_registry.yaml` are confirmed by an operator
@@ -23,15 +25,21 @@ Priorities, in order:
 configs/            Default configuration (settings.yaml, model_registry.yaml,
                     channel_profiles.yaml, vocab.yaml)
 src/studio/
-  cli.py            Typer CLI: init, doctor, run, worker, resume, db, gates, budget
+  cli.py            Typer CLI: init, doctor, run, worker, resume, db, gates, budget,
+                    voice, audio, shot, media, export, render, bible, publish, purge
   config/           Loader with ${STUDIO_HOME} interpolation and validation
   core/             Gateway, budget ledger, CAS, canonical JSON/cache keys,
                     pricing, retry, rate limiter, ids, clock, fault injection
   db/               SQLite connection (WAL, FK on, busy_timeout=5000), migrations, repos
-  demo/             Demo seed + demo stages (LLM → TTS → keyframes → clips → finalize)
+  demo/             Demo seed + demo stages (LLM → TTS → keyframes → clips → S9–S13)
   domain/           Money (integer micro-USD), enums, errors, refs (SubjectRef lineage)
   pipeline/         DAG, engine (invalidation/gates/budget halt), worker, recovery,
                     stages_audio (S5a preflight, S5 TTS, S6 timing, S7 plan, S7b mix)
+  assemble/         S11: segment plan, concat copy-join or re-encode, audio mux
+  video/            ffmpeg/ffprobe wrappers, geometry, encoders, animatic + QC probes
+  export/           S13: sidecar, thumbnail candidates, slug/limits, preset matrix
+  bible/            S14: schema/evidence validation, proposal propose/accept/reject
+  retention/        S15: publish marker, protection index, purge plan/run, GC
   audio/            Audio engine: analysis, library, timeline, conform, stem, selector,
                     envelope, ducking, mixer, mastering (stdlib + ffmpeg only)
   qc/               Persisted audio QC (qc_results)
@@ -327,6 +335,67 @@ studio media smoke --cap-usd 3.00 --yes      # opt-in live smoke (§Q), never in
 Opt-in live tests: `STUDIO_LIVE_FAL=1 python -m pytest tests/test_phase4_fal.py -k live -q`
 (one image under $0.25, one shortest clip under $1.50). Nothing live runs in CI.
 
+## Render, export, bible and retention (Phase 5)
+
+```
+s8_keyframes → s9_animatic (SHOT; free render; gate G2_KEYFRAMES)
+  → s10p_clip_preflight → s10_clips (SHOT)
+  → s11_assemble (LANGUAGE; free concat + audio mux) → s12_render_qc (LANGUAGE; free; gate G3_FINAL_CUT)
+  → s13_export (LANGUAGE; free)   s14_bible_proposals (EPISODE; paid, parked at G1)
+```
+
+* **The animatic is a real render.** S9 concatenates the approved keyframes at
+  the locked S6 timing (`clip_frames`, `hold_frames`) into a silent H.264 MP4 so
+  G2 reviews motion, not stills. S9/S11/S12/S13 never call a provider: they read
+  CAS and run ffmpeg only.
+* **S11 assembles, S12 checks.** The MP4 is exactly Σ `clip_frames` frames with
+  the mixed audio; S12 re-probes it (frame count, duration, A/V sync, black and
+  freeze runs, loudness) and records the checklist that G3 reviews.
+  `studio render rebuild <run-id>` re-renders from CAS for free.
+* **S13 writes a directory, never a database blob.** `export/<series>/<episode>/<lang>/`
+  holds the MP4, `metadata.json` (the sidecar: hashes, timing, licences, flags)
+  and `thumbnail_candidates/frame_*.png`. Re-renders create `_r2` and keep the
+  old directory. A final-profile run needs G1, G0, G2 and G3 approved against
+  the current snapshots; draft/sandbox runs write under `export.draft_root` and
+  record the blockers as `export_flags`. Nothing is published by exporting.
+* **S14 proposes, the operator decides.** One paid LLM call turns the finished
+  episode into evidence-cited bible facts; the proposal is stored `pending` and
+  is **never** auto-applied. `accept` refuses a stale base and bumps the bible
+  version with a row; `reject` leaves the bible untouched. S14 is parked at G1
+  so it cannot spend before the script is approved, and it is refused until G3
+  clears.
+* **S15 makes publishing a fact.** `publish mark` records the URL and timestamp
+  (it needs a prior export) and closes the episode to paid stages
+  (`EpisodeClosed`); free stages such as a re-export still run. `purge plan` is
+  free and dry by default; `purge run` deletes only published-episode assets in
+  the configured windows (raw clips, narration audio, rejected attempts,
+  intermediates) and never touches anything protected: bible, permanent
+  retention rows, gate-approved keyframes and anything a second, unpublished
+  episode still references. A purged asset can never cause a silent re-pay: a
+  later cache hit raises `AssetPurged` unless the operator passes
+  `--allow-repay-purged` (audited). `purge gc` removes CAS orphans, scratch and
+  stale `.tmp-*` export directories.
+
+```bash
+studio run --demo --profile sandbox --languages ar   # mock providers, real ffmpeg, ends in S13
+studio gates list --run <run-id>                     # G1 → G0 → G2 → G3, in that order
+studio export <run-id>                               # free: re-writes the export directory
+studio render rebuild <run-id>                       # free: re-render from CAS
+studio bible propose <episode-id>                    # prints the worst-case cost first; needs --yes
+studio bible accept <proposal-id> --note "why"       # bumps the bible version
+studio publish mark <deliverable-id> --url <url> --yes
+studio purge plan --episode <episode-id>             # deletes nothing
+studio purge run --episode <episode-id>              # dry run unless --yes
+studio purge gc                                     # dry run unless --yes
+studio doctor                                        # + export root, presets/channels, retention windows
+```
+
+`studio doctor` additionally checks that the export root is writable (and the
+disk has room), that every channel key has a matching preset, and that the
+retention windows are ordered (raw clips ≥ narration audio ≥ intermediates).
+Every one of the above commands prints what it will do and refuses to write or
+spend without `--yes`.
+
 ## Adding a provider (Phase 2+)
 
 1. Add the model to `configs/model_registry.yaml` with real pricing
@@ -343,7 +412,8 @@ Opt-in live tests: `STUDIO_LIVE_FAL=1 python -m pytest tests/test_phase4_fal.py 
 GitHub Actions (`.github/workflows/ci.yml`) runs ruff, mypy, an ffmpeg
 capability check (`scripts/check_ffmpeg.py`: ffmpeg ≥ 5.0 and the full filter
 list incl. `loudnorm ebur128 astats sidechaincompress`), and the test suite
-with the 90% coverage gate on **Ubuntu and Windows**, Python 3.11 and 3.12,
+with the 91% coverage gate plus `scripts/check_coverage_floors.py` (per-module
+floors from `coverage_floors.json`) on **Ubuntu and Windows**, Python 3.11 and 3.12,
 via `pytest -m "not slow"`. ffmpeg comes from
 `FedericoCarboni/setup-ffmpeg` (pinned) on both OSes; ffmpeg-marked tests
 auto-skip if the binaries are unavailable.

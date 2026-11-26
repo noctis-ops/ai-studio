@@ -35,6 +35,8 @@ COV_PACKAGES = (
     "studio.core", "studio.db", "studio.pipeline", "studio.audio",
     "studio.providers.tts", "studio.qc", "studio.video", "studio.media",
     "studio.providers",
+    # Phase 5 §Q: the new packages joined the gate.
+    "studio.assemble", "studio.export", "studio.retention", "studio.bible",
 )
 
 
@@ -92,7 +94,12 @@ def test_ci_02_ci_coverage_paths_and_threshold() -> None:
     joined = "\n".join(coverage_runs)
     for package in COV_PACKAGES:
         assert f"--cov={package}" in joined, f"coverage path missing: {package}"
-    assert "--cov-fail-under=90" in joined
+    # Phase 5 §Q raised the total gate from 90% to 91%.
+    assert "--cov-fail-under=91" in joined
+    # ...and CI runs the per-module floors script on the JSON report.
+    runs = _run_lines(_ci())
+    assert any("check_coverage_floors.py" in run for run in runs)
+    assert any("--cov-report=json" in run for run in runs)
 
 
 def test_ci_02_ci_matrix_and_quality_steps() -> None:

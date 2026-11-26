@@ -101,6 +101,10 @@
     {
       "glob": "src/studio/db/repos/proposals.py",
       "floor": 88.0
+    },
+    {
+      "glob": "src/studio/retention/*.py",
+      "floor": 88.0
     }
   ]
 }

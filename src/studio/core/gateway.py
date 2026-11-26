@@ -57,6 +57,7 @@ from studio.db.repos.assets import SqliteAssetsRepo
 from studio.db.repos.providers import NewCacheEntry, NewCall, SqliteProvidersRepo
 from studio.domain.enums import ErrorClass
 from studio.domain.errors import (
+    AssetPurged,
     ContentPolicyError,
     GateNotCleared,
     JobPendingTimeoutError,
@@ -109,6 +110,9 @@ class CallContext:
     # gate_exempt instead. Defaults preserve every Phase 1-3 caller.
     gate_cleared: bool = True
     gate_exempt: str | None = None
+    # §M never-pay-twice: a cache hit whose asset was purged fails closed. Only
+    # an explicit, audited CLI action may set this and re-pay.
+    allow_repay_purged: bool = False
 
 
 @dataclass(frozen=True)
@@ -207,6 +211,40 @@ class ProviderGateway:
             hit = await asyncio.to_thread(self._cache_hit, cached)
             if hit is not None:
                 return hit
+            purged = await asyncio.to_thread(self._purged_cache_assets, cached)
+            if purged:
+                if not ctx.allow_repay_purged:
+                    await asyncio.to_thread(
+                        self.ledger.audit.append,
+                        actor="gateway",
+                        entity=f"run:{ctx.stage_run_id or 'cli'}",
+                        event="cache_hit_purged",
+                        payload={
+                            "kind": kind,
+                            "model_key": model_key,
+                            "purpose": ctx.purpose,
+                            "cache_key": cache_key,
+                            "purged": purged,
+                        },
+                    )
+                    raise AssetPurged(
+                        f"cache hit for {ctx.purpose!r} points at purged asset(s) "
+                        f"{', '.join(purged[:3])}; refusing to re-pay implicitly "
+                        "(pass --allow-repay-purged on an explicit action to override)"
+                    )
+                await asyncio.to_thread(
+                    self.ledger.audit.append,
+                    actor="gateway",
+                    entity=f"run:{ctx.stage_run_id or 'cli'}",
+                    event="repay_purged_allowed",
+                    payload={
+                        "kind": kind,
+                        "model_key": model_key,
+                        "purpose": ctx.purpose,
+                        "cache_key": cache_key,
+                        "purged": purged,
+                    },
+                )
 
         # -- H0: gate barrier inside the gateway (defense in depth) --------
         # Cache hits are free and always allowed. Non-cached TTS/image/video
@@ -745,6 +783,19 @@ class ProviderGateway:
             "duration_s": req.duration_s,
             "seed": req.seed,
         }
+
+    def _purged_cache_assets(self, cached: Any) -> list[str]:
+        """Cache-entry assets that are marked purged (the fail-closed trigger)."""
+        try:
+            shas = json.loads(cached.assets_json)
+        except (json.JSONDecodeError, TypeError):
+            return []
+        purged: list[str] = []
+        for sha in shas:
+            row = self._assets_repo.get(str(sha))
+            if row is not None and row.purged_at is not None:
+                purged.append(str(sha))
+        return purged
 
     def _cache_hit(self, cached: Any) -> GatewayResult | None:
         try:

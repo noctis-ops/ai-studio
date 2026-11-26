@@ -136,6 +136,15 @@ def _pending_gate_id(home: Path) -> str:
     return str(row["id"])
 
 
+def _pending_count(home: Path) -> int:
+    conn = sqlite3.connect(str(home / "data" / "studio.db"))
+    row = conn.execute(
+        "SELECT count(*) FROM approval_gates WHERE status = 'pending'"
+    ).fetchone()
+    conn.close()
+    return int(row[0])
+
+
 def _run_status(home: Path) -> str:
     conn = sqlite3.connect(str(home / "data" / "studio.db"))
     conn.row_factory = sqlite3.Row
@@ -166,27 +175,34 @@ def test_cli_end_to_end_demo(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     assert _run_status(home) == "awaiting_approval"
 
-    for stage in ("G1_SCRIPT", "G2_KEYFRAMES", "G3_FINAL_CUT"):
+    # Phase 5 (§O-1): the demo tail is the real S9-S13. The demo seed has no
+    # character sheets and no metadata review, so it parks exactly three times:
+    # G1 (script), G2 (animatic) and G3 (render).
+    approved = 0
+    for _ in range(8):
+        if _pending_count(home) == 0:
+            break
         gate_id = _pending_gate_id(home)
         result = runner.invoke(app, ["gates", "approve", gate_id])
         assert result.exit_code == 0, result.output
         result = runner.invoke(app, ["worker", "--until-idle"])
         assert result.exit_code == 0, result.output
-        if stage != "G3_FINAL_CUT":
-            assert _run_status(home) == "awaiting_approval"
+        approved += 1
 
+    assert approved == 3, f"expected three gate rounds, approved {approved}"
     assert _run_status(home) == "completed"
 
-    # the manifest asset exists and resolves
+    # S13 wrote a real export: the row points at a directory with the sidecar.
     conn = sqlite3.connect(str(home / "data" / "studio.db"))
     conn.row_factory = sqlite3.Row
-    manifest = conn.execute(
-        "SELECT sha256, rel_path FROM assets WHERE kind = 'manifest'"
+    export = conn.execute(
+        "SELECT dir_path, render_asset_id FROM exports"
     ).fetchone()
-    assert manifest is not None
-    rel_path = str(manifest["rel_path"])
-    assert "/" in rel_path and "\\" not in rel_path
-    assert (home / "data" / "cas" / rel_path).is_file()
+    assert export is not None
+    directory = Path(str(export["dir_path"]))
+    assert (directory / "metadata.json").is_file()
+    assert list(directory.glob("*.mp4"))
+    assert export["render_asset_id"]
     conn.close()
 
 

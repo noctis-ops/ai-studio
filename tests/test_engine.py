@@ -336,8 +336,11 @@ async def test_worker_crash_mid_stage_requeues_and_pays_zero_repaid(
     calls = db.connect().execute(
         "SELECT capability, count(*) AS n FROM provider_calls GROUP BY capability"
     ).fetchall()
+    # Phase 5 (§O-1): the demo DAG ends in the real S11/S12/S13 and adds S14,
+    # so the single `demo_script` LLM call becomes two (script + bible_update).
+    # Crash-resume still pays for neither twice.
     assert {dict(c)["capability"]: dict(c)["n"] for c in calls} == {
-        "llm": 1, "tts": 3, "image_reference_generate": 3, "image_to_video": 3,
+        "llm": 2, "tts": 3, "image_reference_generate": 3, "image_to_video": 3,
     }
     requeued = db.connect().execute(
         "SELECT count(*) FROM audit_events WHERE event = 'job_recovery_requeued'"
@@ -726,10 +729,12 @@ async def test_demo_dag_through_s10_counts_and_formula(tmp_path, monkeypatch):
             "SELECT clip_duration_ms FROM shots WHERE id = ?", (shot_id,)
         ).fetchone()["clip_duration_ms"]
         assert after == locked_ms
-    final_row = db.connect().execute(
-        "SELECT status FROM stage_runs WHERE stage = 'demo_finalize'"
-    ).fetchone()
-    assert final_row is not None and final_row["status"] == "succeeded"
+    # §O-1: `demo_finalize` is gone; the tail is the real S11 → S12 → S13.
+    for stage in ("s11_assemble", "s12_render_qc", "s13_export"):
+        rows = db.connect().execute(
+            "SELECT status FROM stage_runs WHERE stage = ?", (stage,)
+        ).fetchall()
+        assert rows and all(row["status"] == "succeeded" for row in rows), stage
 
 
 # ======================================================================
@@ -1022,7 +1027,8 @@ async def test_invalidation_cascades_downstream_and_reruns_for_free(
         "demo_script", "s4p_media_preflight", "demo_voice",
         "s5a_tts_preflight", "s5_tts", "s6_timing",
         "s7_audio_plan", "s7b_audio_mix",
-        "s8_keyframes", "s10p_clip_preflight", "s10_clips", "demo_finalize",
+        "s8_keyframes", "s9_animatic", "s10p_clip_preflight", "s10_clips",
+        "s11_assemble", "s12_render_qc", "s13_export", "s14_bible_proposals",
     }
     # the pending rows are re-enqueued incrementally: script goes first, the
     # rest follow as dependency stages complete (job completion enqueues advance)
@@ -1037,7 +1043,17 @@ async def test_invalidation_cascades_downstream_and_reruns_for_free(
     assert run is not None and run.status == RunStatus.COMPLETED.value
     # unchanged inputs hit the cache: zero new provider calls
     calls_after = db.connect().execute("SELECT count(*) FROM provider_calls").fetchone()[0]
-    assert calls_after == calls_before
+    # Unchanged inputs hit the cache: the *only* stage that may re-pay is S14,
+    # whose prompt embeds the concept this test just edited. Everything else
+    # (TTS, images, clips, renders) resumes from the content-addressed cache.
+    new_rows = db.connect().execute(
+        "SELECT capability, purpose FROM provider_calls ORDER BY rowid DESC LIMIT ?",
+        (calls_after - calls_before,),
+    ).fetchall()
+    assert [(r["capability"], r["purpose"]) for r in new_rows] == [("llm", "bible_update")], (
+        calls_after,
+        calls_before,
+    )
 
 
 @pytest.mark.asyncio

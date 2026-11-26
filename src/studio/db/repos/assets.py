@@ -61,7 +61,7 @@ class AssetsRepo(Protocol):
 
     def get(self, sha256: str) -> AssetRow | None: ...
 
-    def mark_purged(self, sha256: str) -> bool: ...
+    def mark_purged(self, sha256: str, *, reason: str | None = None) -> bool: ...
 
     def exists_live(self, sha256: str) -> bool: ...
 
@@ -117,11 +117,12 @@ class SqliteAssetsRepo(SqliteRepo):
         )
         return AssetRow.model_validate(row_to_dict(row)) if row else None
 
-    def mark_purged(self, sha256: str) -> bool:
+    def mark_purged(self, sha256: str, *, reason: str | None = None) -> bool:
         now = self._now()
         cur = self.db.connect().execute(
-            "UPDATE assets SET purged_at = ? WHERE sha256 = ? AND purged_at IS NULL",
-            (now, sha256),
+            "UPDATE assets SET purged_at = ?, purge_reason = COALESCE(?, purge_reason) "
+            "WHERE sha256 = ? AND purged_at IS NULL",
+            (now, reason, sha256),
         )
         return cur.rowcount > 0
 

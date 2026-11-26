@@ -65,6 +65,10 @@ class ContentRepo(Protocol):
 
     def get_deliverable(self, deliverable_id: str) -> DeliverableRow | None: ...
 
+    def set_deliverable_published(
+        self, deliverable_id: str, *, published_at: str, published_url: str
+    ) -> None: ...
+
     def create_shot(
         self,
         *,
@@ -364,6 +368,20 @@ class SqliteContentRepo(SqliteRepo):
         result = self.db.connect().execute(
             "UPDATE deliverables SET metadata_json = ?, safety_status = ? WHERE id = ?",
             (metadata_json, safety_status, deliverable_id),
+        )
+        if result.rowcount != 1:
+            raise StudioError(f"deliverable not found: {deliverable_id}")
+
+    def set_deliverable_published(
+        self, deliverable_id: str, *, published_at: str, published_url: str
+    ) -> None:
+        from studio.domain.errors import StudioError
+
+        if not published_url.strip():
+            raise StudioError("published_url must not be empty")
+        result = self.db.connect().execute(
+            "UPDATE deliverables SET published_at = ?, published_url = ? WHERE id = ?",
+            (published_at, published_url.strip(), deliverable_id),
         )
         if result.rowcount != 1:
             raise StudioError(f"deliverable not found: {deliverable_id}")

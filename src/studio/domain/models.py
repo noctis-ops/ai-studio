@@ -156,6 +156,8 @@ class AssetRow(_Row):
     created_at: str
     purged_at: str | None
     purge_after: str | None = None
+    # Phase 5 (§M): why a purge removed it (`s15_purge:<class>: episode <id>`).
+    purge_reason: str | None = None
 
 
 class SceneRow(_Row):

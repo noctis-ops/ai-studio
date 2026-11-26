@@ -31,6 +31,7 @@ from studio.core.gateway import CallContext
 from studio.domain.enums import GateKind, Scope
 from studio.domain.errors import PermanentProviderError
 from studio.domain.refs import SubjectRef
+from studio.export.stage import ExportHandler
 from studio.media.stages import (
     CharacterSheetHandler,
     ClipGenHandler,
@@ -45,6 +46,12 @@ from studio.pipeline.stages_audio import (
     TimingReconcilerHandler,
     TtsLineHandler,
     TtsPreflightHandler,
+)
+from studio.pipeline.stages_bible import BibleProposalHandler
+from studio.pipeline.stages_render import (
+    AnimaticHandler,
+    AssembleHandler,
+    RenderQcHandler,
 )
 from studio.providers.base import LLMRequest
 
@@ -527,13 +534,23 @@ def demo_specs() -> list[StageSpec]:
             scope=Scope.SHOT,
             depends_on=("s8a_character_sheets",),
             handler=KeyframeHandler(),
-            gate_after=GateKind.G2_KEYFRAMES,
+            gate_after=None,
             spends_money=True,
+        ),
+        # Phase 5 (§O-2): G2 sits on the animatic, not on the keyframes.
+        StageSpec(
+            name="s9_animatic",
+            scope=Scope.DELIVERABLE,
+            depends_on=("s8_keyframes", "s7b_audio_mix"),
+            handler=AnimaticHandler(),
+            gate_after=GateKind.G2_KEYFRAMES,
+            gate_reject_stage="s8_keyframes",
+            spends_money=False,
         ),
         StageSpec(
             name="s10p_clip_preflight",
             scope=Scope.EPISODE,
-            depends_on=("s8_keyframes",),
+            depends_on=("s9_animatic",),
             handler=ClipPreflightHandler(),
             gate_after=None,
             spends_money=False,
@@ -546,11 +563,43 @@ def demo_specs() -> list[StageSpec]:
             gate_after=None,
             spends_money=True,
         ),
+        # Phase 5 (§O-1): the demo tail is the *real* S11 → S12 (G3) → S13,
+        # so the sandbox demo exercises assembly, real render QC and the export
+        # package over mock providers instead of a JSON manifest.
         StageSpec(
-            name="demo_finalize",
+            name="s11_assemble",
             scope=Scope.DELIVERABLE,
-            depends_on=("s10_clips",),
-            handler=DemoFinalizeHandler(),
+            depends_on=("s10_clips", "s7b_audio_mix"),
+            handler=AssembleHandler(),
+            gate_after=None,
+            spends_money=False,
+        ),
+        StageSpec(
+            name="s12_render_qc",
+            scope=Scope.DELIVERABLE,
+            depends_on=("s11_assemble",),
+            handler=RenderQcHandler(),
             gate_after=GateKind.G3_FINAL_CUT,
+            gate_reject_stage="s11_assemble",
+            spends_money=False,
+        ),
+        StageSpec(
+            name="s13_export",
+            scope=Scope.DELIVERABLE,
+            depends_on=("s12_render_qc",),
+            handler=ExportHandler(),
+            gate_after=None,
+            spends_money=False,
+            requires_cleared_gates=True,
+        ),
+        # S14 in the demo: the mock LLM answers, so this is one free-looking
+        # paid call (`spends_money` keeps the H0 barrier honest).
+        StageSpec(
+            name="s14_bible_proposals",
+            scope=Scope.EPISODE,
+            depends_on=("demo_script",),
+            handler=BibleProposalHandler(),
+            gate_after=None,
+            spends_money=True,
         ),
     ]

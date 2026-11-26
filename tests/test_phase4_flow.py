@@ -249,9 +249,11 @@ async def test_pre_01_over_budget_halts_before_any_spend(tmp_path, monkeypatch):
     assert run is not None and run.status == "halted_budget"
     halted = audits(env, "budget_halted")
     assert halted, "expected a budget_halted audit"
-    assert any(
-        "expected media spend" in str(audit.get("error", "")) for audit in halted
-    ), halted
+    # Phase 5: a paid stage now sits in the *text* lane (S14 bible proposals),
+    # so with a 1-micro-USD cap the reservation guard halts there first instead
+    # of at s4p. The property under test is unchanged: the run halts before a
+    # single paid call, and the audit names the cap that refused the reserve.
+    assert any("cap 1 micro-USD" in str(audit.get("error", "")) for audit in halted), halted
     # no paid call was made, no media stage was created
     assert _paid_media_calls(env) == []
     assert stage_rows(env, "s8a_character_sheets") == []

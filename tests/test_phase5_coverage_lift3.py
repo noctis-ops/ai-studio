@@ -112,3 +112,34 @@ def test_clips_unknown_track_and_episode_are_permanent(tmp_path, monkeypatch):
             await handler.run(orphan, subject)
 
     asyncio.run(scenario())
+
+
+# ----------------------------------------------------------------------
+# §Q floor: media/preflight.py's "no row, no configured default" branch.
+# ----------------------------------------------------------------------
+
+
+def test_preflight_budget_row_cap_uses_the_configured_default():
+    from types import SimpleNamespace
+
+    from studio.domain.enums import BudgetScope
+    from studio.media.preflight import _budget_row_cap
+
+    ctx = SimpleNamespace(repos=SimpleNamespace(budgets=SimpleNamespace(get=lambda *a: None)))
+    # explicit row wins...
+    row = SimpleNamespace(cap_musd=12_345)
+    ctx_row = SimpleNamespace(repos=SimpleNamespace(budgets=SimpleNamespace(get=lambda *a: row)))
+    assert _budget_row_cap(ctx_row, BudgetScope.EPISODE, "e1", None) == 12_345
+    # ...an absent row with no default is "no cap"...
+    assert _budget_row_cap(ctx, BudgetScope.EPISODE, "e1", None) is None
+    # ...and an absent row with a USD default is converted to micro-USD.
+    assert _budget_row_cap(ctx, BudgetScope.EPISODE, "e1", 2.5) == 2_500_000
+
+    # `_remaining_musd` is "unknown" without a cap and otherwise cap - held.
+    from studio.media.preflight import _remaining_musd
+
+    assert _remaining_musd(ctx, BudgetScope.EPISODE, "e1", None) is None
+    held_ctx = SimpleNamespace(
+        repos=SimpleNamespace(budgets=SimpleNamespace(held_musd=lambda *a: 400))
+    )
+    assert _remaining_musd(held_ctx, BudgetScope.EPISODE, "e1", 1_000) == 600

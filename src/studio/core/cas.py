@@ -134,9 +134,9 @@ class ContentStore:
             return False
         return (self.root / row.rel_path).is_file()
 
-    def mark_purged(self, sha256: str) -> None:
+    def mark_purged(self, sha256: str, *, reason: str | None = None) -> None:
         row = self.assets.get(sha256)
-        self.assets.mark_purged(sha256)
+        self.assets.mark_purged(sha256, reason=reason)
         if row is not None:
             try:
                 (self.root / row.rel_path).unlink(missing_ok=True)

@@ -46,4 +46,9 @@ jobs:
           --cov=studio.core --cov=studio.db --cov=studio.pipeline
           --cov=studio.audio --cov=studio.providers.tts
           --cov=studio.qc --cov=studio.video --cov=studio.media --cov=studio.providers
-          --cov-report=term-missing --cov-fail-under=90
+          --cov=studio.assemble --cov=studio.export --cov=studio.retention
+          --cov=studio.bible
+          --cov-report=term-missing --cov-report=json --cov-fail-under=91
+
+      - name: Per-module coverage floors (Phase 5 §Q)
+        run: python scripts/check_coverage_floors.py coverage.json coverage_floors.json

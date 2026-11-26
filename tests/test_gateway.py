@@ -15,6 +15,7 @@ from studio.core.gateway import CallContext
 from studio.db import Database, migrate
 from studio.domain.enums import Aspect
 from studio.domain.errors import (
+    AssetPurged,
     PolicyRefusalError,
     TransientProviderError,
     ZeroByteAssetError,
@@ -25,8 +26,14 @@ from studio.providers.mock.image import MockImageProvider
 from studio.providers.mock.llm import MockLLMProvider
 
 
-def _ctx(episode_id=None, nonce: str = "0") -> CallContext:
-    return CallContext(episode_id=episode_id, stage_run_id=None, nonce=nonce, purpose="test")
+def _ctx(episode_id=None, nonce: str = "0", allow_repay_purged: bool = False) -> CallContext:
+    return CallContext(
+        episode_id=episode_id,
+        stage_run_id=None,
+        nonce=nonce,
+        purpose="test",
+        allow_repay_purged=allow_repay_purged,
+    )
 
 
 def _ledger_count(db, entry_type: str | None = None) -> int:
@@ -205,9 +212,24 @@ async def test_purged_asset_turns_cache_hit_into_miss(tmp_path, monkeypatch):
     first = await gw.image("mock.image", req, _ctx(nonce="n1"))
     store.mark_purged(first.assets[0].sha256)
 
-    second = await gw.image("mock.image", req, _ctx(nonce="n1"))
-    assert second.cache_hit is False
+    # Phase 5 (§M): a purged asset no longer turns the hit into a silent miss
+    # (a "free" re-pay). It fails closed, audited, and only an explicit
+    # allow_repay_purged context may spend again.
+    with pytest.raises(AssetPurged):
+        await gw.image("mock.image", req, _ctx(nonce="n1"))
+    assert provider.submit_count == 1
+    events = [row["event"] for row in db.connect().execute(
+        "SELECT event FROM audit_events ORDER BY rowid").fetchall()]
+    assert "cache_hit_purged" in events
+
+    third = await gw.image(
+        "mock.image", req, _ctx(nonce="n1", allow_repay_purged=True)
+    )
+    assert third.cache_hit is False
     assert provider.submit_count == 2
+    events = [row["event"] for row in db.connect().execute(
+        "SELECT event FROM audit_events ORDER BY rowid").fetchall()]
+    assert "repay_purged_allowed" in events
 
 
 # --------------------------------------------------------------- T-GW-06
